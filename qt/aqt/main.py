@@ -1017,6 +1017,9 @@ title="{}" {}>{}</button>""".format(
             self.installAddon(args[0], startup=True)
 
         if not self.safeMode:
+            from aqt.weibao.review_capture import install as install_review_capture
+
+            install_review_capture()
             self.addonManager.loadAddons()
 
     def maybe_check_for_addon_updates(
