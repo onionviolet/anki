@@ -10,5 +10,6 @@ license notice. The surrounding Anki fork is AGPL-3.0-or-later.
 
 Fork changes are limited to explicit startup after add-on loading, profile
 configuration supplied by `aqt.weibao.ankiconnect`, an optional bind-port
-environment override for isolated testing, and graceful handling of a busy
-port. The server and API actions otherwise use the upstream implementation.
+environment override for isolated testing, graceful handling of a busy port,
+and a reliable delayed callback for `guiExitAnki`. The server and API actions otherwise
+use the upstream implementation.

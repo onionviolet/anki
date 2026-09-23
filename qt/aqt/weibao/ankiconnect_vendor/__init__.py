@@ -1895,9 +1895,7 @@ class AnkiConnect:
 
     @util.api()
     def guiExitAnki(self):
-        timer = QTimer()
-        timer.timeout.connect(self.window().close)
-        timer.start(1000) # 1s should be enough to allow the response to be sent.
+        QTimer.singleShot(1000, self.window().close)
 
 
     @util.api()
