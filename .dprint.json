@@ -18,6 +18,7 @@
         "qt/aqt/data/web/js/vendor/*.js",
         "ftl/qt-repo",
         "ftl/core-repo",
+        "integrations/chinese-support-3",
         "ftl/usage",
         "licenses.json",
         ".dmypy.json",

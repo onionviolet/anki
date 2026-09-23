@@ -16,3 +16,6 @@
 	url = https://github.com/ankitects/briefcase-windows-VisualStudio-template
 	branch = anki
 	shallow = true
+[submodule "integrations/chinese-support-3"]
+	path = integrations/chinese-support-3
+	url = https://github.com/Gustaf-C/anki-chinese-support-3.git

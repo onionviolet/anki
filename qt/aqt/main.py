@@ -1017,9 +1017,11 @@ title="{}" {}>{}</button>""".format(
             self.installAddon(args[0], startup=True)
 
         if not self.safeMode:
+            from aqt.weibao.chinese_support import install as install_chinese_support
             from aqt.weibao.review_capture import install as install_review_capture
 
             install_review_capture()
+            install_chinese_support(self.pm.addonFolder())
             self.addonManager.loadAddons()
             from aqt.weibao.ankiconnect import install as install_ankiconnect
 

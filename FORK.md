@@ -16,6 +16,10 @@ The fork also bundles the AnkiConnect v6 server in `qt/aqt/weibao/ankiconnect_ve
 
 No collection content, review history, profile paths, or credentials belong in this repository.
 
+## Optional Chinese Support 3
+
+The fork bundles the pinned Chinese Support 3 add-on from `integrations/chinese-support-3`. On launch outside safe mode, it copies the add-on into the active Anki base if that add-on is absent, then Anki loads it normally. An existing installed copy and its configuration win. See `integrations/CHINESE_SUPPORT3.md` for the source, license, and boundaries. The fork does not enable its field filling on a note type or alter the existing `Mandarin Merged` tone display.
+
 ## Local verification
 
 An isolated fork launch with a separate single-instance key, base folder, and API port returned AnkiConnect v6, one default deck, and zero notes through the bundled `ankictl` client. The `aqt` wheel contains the client, server source, and license. The Rust bridge loaded after rebuilding with Rust 1.98.1; Rust 1.97.1 generated a misaligned `LINKEDIT` string pool rejected by macOS 27, matching [rust-lang/rust#157750](https://github.com/rust-lang/rust/issues/157750). The fork pins 1.98.1. `just check` passed with the repository's `CONTRIBUTORS_BYPASS_EMAILS` setting for this fork author: 184 pylib tests, 130 Qt tests, 672 Rust tests, 71 TypeScript tests, and formatting, typing, and lint checks. The fork is not installed over the daily Anki app.

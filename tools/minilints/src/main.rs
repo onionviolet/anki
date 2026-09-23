@@ -44,6 +44,7 @@ const IGNORED_FOLDERS: &[&str] = &[
     "./.venv",
     "./qt/installer/windows-template",
     "./qt/installer/mac-template",
+    "./integrations/chinese-support-3",
 ];
 
 fn main() -> Result<()> {

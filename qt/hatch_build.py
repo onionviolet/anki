@@ -32,6 +32,7 @@ class CustomBuildHook(BuildHookInterface):
 
         assert generated_root.exists(), "you should build with --wheel"
         self._add_aqt_files(force_include, generated_root)
+        self._add_chinese_support(force_include, project_root)
 
     def _set_anki_dependency(self, version: str, build_data: Dict[str, Any]) -> None:
         # Get current dependencies and replace 'anki' with exact version
@@ -76,3 +77,16 @@ class CustomBuildHook(BuildHookInterface):
         if path.name.startswith("tsconfig"):
             return True
         return False
+
+    def _add_chinese_support(
+        self, force_include: Dict[str, str], project_root: Path
+    ) -> None:
+        source = project_root / "integrations" / "chinese-support-3" / "chinese"
+        assert (source / "__init__.py").is_file(), (
+            "initialize integrations/chinese-support-3 before building the fork"
+        )
+        for path in source.rglob("*"):
+            if path.is_file() and "__pycache__" not in path.parts:
+                relative = path.relative_to(source)
+                destination = Path("aqt/weibao/chinese_support_vendor") / relative
+                force_include[str(path)] = str(destination)
