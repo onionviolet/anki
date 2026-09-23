@@ -14,6 +14,10 @@ build:
 run *args:
     {{ run_script }} {{ args }}
 
+# Run the bundled ankictl client against a running Anki instance
+bridge *args:
+    python3 integrations/ankictl/ankictl.py {{ args }}
+
 # Build and run Anki in optimized (release) mode
 run-optimized *args:
     {{ if os() == "windows" { "$env:RELEASE='1'; .\\run.bat" } else { "RELEASE=1 ./run" } }} {{ args }}

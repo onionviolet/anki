@@ -80,6 +80,7 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 anki = "aqt:run"
+ankictl = "weibao_ankictl:main"
 
 [project.gui-scripts]
 ankiw = "aqt:run"
@@ -87,6 +88,10 @@ ankiw = "aqt:run"
 [tool.hatch.build.targets.wheel]
 packages = ["aqt"]
 exclude = ["aqt/data", "**/*.ui"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../integrations/ankictl/ankictl.py" = "weibao_ankictl.py"
+"../integrations/ankictl/LICENSE" = "weibao_ankictl.LICENSE"
 
 [tool.hatch.version]
 source = "code"
