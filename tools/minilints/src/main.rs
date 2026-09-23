@@ -22,6 +22,10 @@ use walkdir::WalkDir;
 
 const NONSTANDARD_HEADER: &[&str] = &[
     "./integrations/ankictl/ankictl.py",
+    "./qt/aqt/weibao/ankiconnect_vendor/__init__.py",
+    "./qt/aqt/weibao/ankiconnect_vendor/edit.py",
+    "./qt/aqt/weibao/ankiconnect_vendor/util.py",
+    "./qt/aqt/weibao/ankiconnect_vendor/web.py",
     "./pylib/anki/_vendor/stringcase.py",
     "./pylib/anki/statsbg.py",
     "./qt/aqt/mpv.py",

@@ -9,7 +9,7 @@ lint.select = [
   # "SIM", # flake8-simplify
 ]
 
-extend-exclude = ["*_pb2.py", "*_pb2.pyi"]
+extend-exclude = ["*_pb2.py", "*_pb2.pyi", "qt/aqt/weibao/ankiconnect_vendor"]
 
 lint.ignore = [
   # Docstring rules (missing-*-docstring in pylint)

@@ -360,7 +360,10 @@ fn build_wheel(build: &mut Build) -> Result<()> {
 }
 
 fn check_python(build: &mut Build) -> Result<()> {
-    let py_inputs = inputs![glob!("qt/**/*.py", "qt/installer/*-template/**")];
+    let py_inputs = inputs![glob!(
+        "qt/**/*.py",
+        "{qt/installer/*-template/**,qt/aqt/weibao/ankiconnect_vendor/**}"
+    )];
 
     python_format(build, "qt", py_inputs.clone())?;
 

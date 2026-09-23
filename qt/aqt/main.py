@@ -1021,6 +1021,9 @@ title="{}" {}>{}</button>""".format(
 
             install_review_capture()
             self.addonManager.loadAddons()
+            from aqt.weibao.ankiconnect import install as install_ankiconnect
+
+            install_ankiconnect(self)
 
     def maybe_check_for_addon_updates(
         self, on_done: Callable[[list[DownloadLogEntry]], None] | None = None
