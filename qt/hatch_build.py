@@ -90,3 +90,6 @@ class CustomBuildHook(BuildHookInterface):
                 relative = path.relative_to(source)
                 destination = Path("aqt/weibao/chinese_support_vendor") / relative
                 force_include[str(path)] = str(destination)
+        force_include[str(source.parent / "LICENSE")] = (
+            "aqt/weibao/chinese_support_vendor/LICENSE"
+        )
