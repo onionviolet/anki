@@ -3,6 +3,7 @@ Copyright: Ankitects Pty Ltd and contributors
 License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 -->
 <script lang="ts">
+    import { DeckConfig_Config_LeechAction } from "@generated/anki/deck_config_pb";
     import * as tr from "@generated/ftl";
     import { HelpPage } from "@tslib/help-page";
     import type Carousel from "bootstrap/js/dist/carousel";
@@ -13,10 +14,12 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     import HelpModal from "$lib/components/HelpModal.svelte";
     import Item from "$lib/components/Item.svelte";
     import SettingTitle from "$lib/components/SettingTitle.svelte";
+    import SwitchRow from "$lib/components/SwitchRow.svelte";
     import TitledContainer from "$lib/components/TitledContainer.svelte";
     import { type HelpItem, HelpItemScheduler } from "$lib/components/types";
 
     import { leechChoices } from "./choices";
+    import GlobalLabel from "./GlobalLabel.svelte";
     import type { DeckOptionsState } from "./lib";
     import SpinBoxRow from "./SpinBoxRow.svelte";
     import StepsInputRow from "./StepsInputRow.svelte";
@@ -28,6 +31,8 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     const config = state.currentConfig;
     const defaults = state.defaults;
     const fsrs = state.fsrs;
+    const fsrsShortTermWithStepsEnabled = state.fsrsShortTermWithStepsEnabled;
+    const fsrsLearningQueuesDisabled = state.fsrsLearningQueuesDisabled;
 
     let stepsExceedMinimumInterval: string;
     let stepsTooLargeForFsrs: string;
@@ -65,6 +70,11 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         leechAction: {
             title: tr.schedulingLeechAction(),
             help: tr.deckConfigLeechActionTooltip(),
+            url: HelpPage.Leeches.waiting,
+        },
+        leechOnlyIfYoung: {
+            title: tr.deckConfigLeechOnlyIfYoung(),
+            help: tr.deckConfigLeechOnlyIfYoungTooltip(),
             url: HelpPage.Leeches.waiting,
         },
     };
@@ -109,6 +119,34 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         <Item>
             <Warning warning={stepsTooLargeForFsrs} />
         </Item>
+
+        {#if $fsrs}
+            <Item>
+                <SwitchRow
+                    bind:value={$fsrsShortTermWithStepsEnabled}
+                    defaultValue={false}
+                >
+                    <SettingTitle>
+                        <GlobalLabel
+                            title={"Allow same day review for (re)learning steps"}
+                        />
+                    </SettingTitle>
+                </SwitchRow>
+            </Item>
+
+            <Item>
+                <SwitchRow
+                    bind:value={$fsrsLearningQueuesDisabled}
+                    defaultValue={false}
+                >
+                    <SettingTitle>
+                        <GlobalLabel
+                            title={"Skip learning/relearning queues with FSRS/RWKV"}
+                        />
+                    </SettingTitle>
+                </SwitchRow>
+            </Item>
+        {/if}
 
         {#if !$fsrs}
             <Item>
@@ -163,5 +201,23 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                 </SettingTitle>
             </EnumSelectorRow>
         </Item>
+
+        {#if $config.leechAction === DeckConfig_Config_LeechAction.SUSPEND}
+            <Item>
+                <SwitchRow
+                    bind:value={$config.leechOnlyIfYoung}
+                    defaultValue={defaults.leechOnlyIfYoung}
+                >
+                    <SettingTitle
+                        on:click={() =>
+                            openHelpModal(
+                                Object.keys(settings).indexOf("leechOnlyIfYoung"),
+                            )}
+                    >
+                        {settings.leechOnlyIfYoung.title}
+                    </SettingTitle>
+                </SwitchRow>
+            </Item>
+        {/if}
     </DynamicallySlottable>
 </TitledContainer>

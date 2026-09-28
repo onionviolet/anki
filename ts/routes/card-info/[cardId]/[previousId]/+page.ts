@@ -19,5 +19,8 @@ export const load = (async ({ params, depends }) => {
     const currentInfo = currentId !== null ? await cardStats({ cid: currentId }) : null;
     const previousId = optionalBigInt(params.previousId);
     const previousInfo = previousId !== null ? await cardStats({ cid: previousId }) : null;
-    return { currentInfo, previousInfo };
+    return {
+        currentInfo,
+        previousInfo,
+    };
 }) satisfies PageLoad;

@@ -34,6 +34,30 @@ rebuild-web:
 wheels:
     {{ ninja }} wheels
 
+# Build a local unsigned macOS installer (.dmg)
+macos-installer:
+    @if [ "{{ os() }}" != "macos" ]; then echo "macos-installer must be run on macOS" >&2; exit 1; fi
+    ./tools/build-installer
+    @echo "Installer written under out/installer/dist/"
+
+# Build a local isolated portable app archive for the current platform
+portable:
+    {{ if os() == "windows" { "$env:RELEASE='2'; " } else { "RELEASE=2 " } }}{{ ninja }} portable_package
+    @echo "Portable app written under out/portable/dist/"
+
+# Build the portable app without packaging it (used when signing precedes packaging)
+portable-build:
+    {{ if os() == "windows" { "$env:RELEASE='2'; " } else { "RELEASE=2 " } }}{{ ninja }} portable_build
+
+# Package an existing portable build without rebuilding it and invalidating signatures
+portable-archive version:
+    {{ python }} qt/tools/build_installer.py --version {{ version }} --portable package
+
+# Backwards-compatible name for building a local macOS portable app (.zip)
+macos-portable:
+    @if [ "{{ os() }}" != "macos" ]; then echo "macos-portable must be run on macOS" >&2; exit 1; fi
+    just portable
+
 # Build and run all checks (lint + test) - lets ninja handle dependencies
 check:
     {{ ninja }} pylib qt check
@@ -171,12 +195,52 @@ docs-rust:
     cargo doc --open
 
 # Dispatch CI workflow on a given branch or tag
+[arg("branch", long)]
 ci branch:
     gh workflow run ci.yml --ref {{ branch }}
 
 # Run Complexipy in regression-only mode
 complexipy-diff:
     {{ ninja }} complexipy-diff
+
+# Audit or repair RWKV synthetic revlog kinds in a copied collection.
+rwkv-review-type-repair *args:
+    {{ ninja }} pyenv
+    {{ python }} qt/tools/rwkv_review_type_repair.py {{ args }}
+
+# Compare Python and Rust RWKV history fingerprints on a copied collection.
+rwkv-history-fingerprint-bench *args:
+    {{ ninja }} pylib qt
+    {{ if os() == "windows" { "$env:PYTHONPATH='pylib;out/pylib;out/qt;out/qt/tools'; " } else { "PYTHONPATH=pylib:out/pylib:out/qt:out/qt/tools " } }}{{ python }} qt/tools/rwkv_history_fingerprint_bench.py {{ args }}
+
+# Compare resident RWKV bridges, prediction memo costs, and history preparation on a collection copy.
+rwkv-review-performance-bench *args:
+    {{ ninja }} pylib qt
+    {{ if os() == "windows" { "$env:PYTHONPATH='pylib;out/pylib;out/qt;out/qt/tools'; " } else { "PYTHONPATH=pylib:out/pylib:out/qt:out/qt/tools " } }}{{ python }} qt/tools/rwkv_review_performance_bench.py {{ args }}
+
+# Measure RWKV review-type metrics on selected current deck ids in a copied collection.
+rwkv-review-type-metrics collection target-deck-ids:
+    {{ if os() == "windows" { "$env:ANKI_RWKV_STATE_COMPRESSION_COLLECTION='" + collection + "'; $env:ANKI_RWKV_STATE_COMPRESSION_TARGET_DECK_IDS='" + target-deck-ids + "'; $env:ANKI_RWKV_STATE_COMPRESSION_MODEL='" + justfile_directory() + "/qt/aqt/rwkv_inference/RWKV_trained_on_5000_10000.bin'; $env:ANKI_RWKV_STATE_COMPRESSION_LIMIT='0'; $env:ANKI_RWKV_STATE_COMPRESSION_CONFIGS='raw'; cargo test -p anki rwkv_state_compression_metrics --release -- --ignored --nocapture" } else { "ANKI_RWKV_STATE_COMPRESSION_COLLECTION='" + collection + "' ANKI_RWKV_STATE_COMPRESSION_TARGET_DECK_IDS='" + target-deck-ids + "' ANKI_RWKV_STATE_COMPRESSION_MODEL='" + justfile_directory() + "/qt/aqt/rwkv_inference/RWKV_trained_on_5000_10000.bin' ANKI_RWKV_STATE_COMPRESSION_LIMIT=0 ANKI_RWKV_STATE_COMPRESSION_CONFIGS=raw cargo test -p anki rwkv_state_compression_metrics --release -- --ignored --nocapture" } }}
+
+# Build and run the standalone RWKV predictor benchmark.
+rwkv-predict-bench *args:
+    cargo run -p anki --release --bin rwkv_predict_bench -- {{ args }}
+
+# Compare original and optimized native query math in alternating order.
+rwkv-query-math-bench:
+    cargo test -p anki --release --lib rwkv_query_math_benchmark -- --ignored --nocapture
+
+# Measure exact FSRS queue sorting and review transitions on synthetic collections.
+fsrs-queue-bench:
+    cargo test -p anki --release --lib fsrs_queue_benchmark -- --ignored --nocapture
+
+# Profile the stages of exact FSRS queue builds with daily limits of 200 and 9,999.
+fsrs-queue-profile:
+    cargo test -p anki --release --lib fsrs_queue_profile -- --ignored --nocapture
+
+# Rebuild a 100,000-card queue repeatedly and print its PID for a native CPU sampler.
+fsrs-queue-sample:
+    cargo test -p anki --release --lib fsrs_queue_sampling -- --ignored --nocapture
 
 # Remove build outputs from out/ (pass keep-env to keep node_modules/pyenv); macOS/Linux
 clean *args:
@@ -189,4 +253,5 @@ run_script := if os() == "windows" { ".\\run.bat" } else { "./run" }
 playwright_env := if os() == "windows" { "set PLAYWRIGHT_BROWSERS_PATH=out\\playwright-browsers&&" } else { "PLAYWRIGHT_BROWSERS_PATH=out/playwright-browsers" }
 yarn := if os() == "windows" { "out\\extracted\\node\\yarn.cmd" } else { "out/extracted/node/bin/yarn" }
 uv := env("UV_BINARY", if os() == "windows" { "out\\extracted\\uv\\uv" } else { "out/extracted/uv/uv" })
+python := if os() == "windows" { ".\\out\\pyenv\\Scripts\\python.exe" } else { "out/pyenv/bin/python" }
 export UV_PROJECT_ENVIRONMENT := if os() == "windows" { "out\\pyenv" } else { "out/pyenv" }

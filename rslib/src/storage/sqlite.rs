@@ -3,14 +3,15 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::fmt::Display;
 use std::hash::Hasher;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bitflags::bitflags;
 use fnv::FnvHasher;
+use fsrs::current_retrievability;
 use fsrs::FSRS5_DEFAULT_DECAY;
 use regex::Regex;
 use rusqlite::functions::FunctionFlags;
@@ -49,7 +50,12 @@ pub struct SqliteStorage {
     pub(crate) db: Connection,
 }
 
-fn open_or_create_collection_db(path: &Path) -> Result<Connection> {
+pub(crate) const RETRIEVABILITY_CACHE_DB_SCHEMA: &str = "retrievability_cache";
+
+fn open_or_create_collection_db(
+    path: &Path,
+    persistent_retrievability_cache: bool,
+) -> Result<Connection> {
     let db = Connection::open(path)?;
 
     if std::env::var("TRACESQL").is_ok() {
@@ -86,7 +92,30 @@ fn open_or_create_collection_db(path: &Path) -> Result<Connection> {
 
     db.create_collation("unicase", unicase_compare)?;
 
+    attach_retrievability_cache_db(&db, persistent_retrievability_cache.then_some(path))?;
+
     Ok(db)
+}
+
+pub(crate) fn retrievability_cache_path(collection_path: &Path) -> PathBuf {
+    if collection_path == Path::new(":memory:") {
+        PathBuf::from(":memory:")
+    } else {
+        collection_path.with_extension("retrievability-cache.sqlite")
+    }
+}
+
+fn attach_retrievability_cache_db(db: &Connection, collection_path: Option<&Path>) -> Result<()> {
+    let cache_path = collection_path
+        .map(retrievability_cache_path)
+        .unwrap_or_else(|| PathBuf::from(":memory:"));
+    let cache_path = cache_path.to_string_lossy();
+    db.execute(
+        &format!("ATTACH DATABASE ? AS {RETRIEVABILITY_CACHE_DB_SCHEMA}"),
+        [cache_path.as_ref()],
+    )?;
+    db.pragma_update(Some(RETRIEVABILITY_CACHE_DB_SCHEMA), "journal_mode", "wal")?;
+    Ok(())
 }
 
 impl SqliteStorage {
@@ -193,14 +222,21 @@ fn add_regexp_fields_function(db: &Connection) -> rusqlite::Result<()> {
                 .get_or_create_aux(0, |vr| -> std::result::Result<_, BoxError> {
                     Ok(Regex::new(vr.as_str()?)?)
                 })?;
-            let fields = ctx.get_raw(1).as_str()?.split('\x1f');
-            let indices: HashSet<usize> = (2..ctx.len())
-                .map(|i| ctx.get(i))
-                .collect::<rusqlite::Result<_>>()?;
+            let fields = ctx.get_raw(1).as_str()?;
+            if ctx.len() == 2 {
+                return Ok(fields.split('\x1f').any(|field| re.is_match(field)));
+            }
 
-            Ok(fields.enumerate().any(|(idx, field)| {
-                (indices.is_empty() || indices.contains(&idx)) && re.is_match(field)
-            }))
+            for (idx, field) in fields.split('\x1f').enumerate() {
+                for arg_idx in 2..ctx.len() {
+                    let selected_idx: usize = ctx.get(arg_idx)?;
+                    if selected_idx == idx && re.is_match(field) {
+                        return Ok(true);
+                    }
+                }
+            }
+
+            Ok(false)
         },
     )
 }
@@ -279,7 +315,8 @@ fn add_extract_custom_data_function(db: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// eg. extract_fsrs_variable(card.data, 's' | 'd' | 'dr') -> float | null
+/// eg. extract_fsrs_variable(card.data, 's' | 's_int' | 's_fast' | 'd' |
+/// 'dr') -> float | null
 fn add_extract_fsrs_variable(db: &Connection) -> rusqlite::Result<()> {
     db.create_scalar_function(
         "extract_fsrs_variable",
@@ -300,6 +337,8 @@ fn add_extract_fsrs_variable(db: &Connection) -> rusqlite::Result<()> {
             let card_data = &CardData::from_str(card_data);
             Ok(match key {
                 "s" => card_data.fsrs_stability,
+                "s_int" => card_data.fsrs_stability_internal,
+                "s_fast" => card_data.fsrs_stability_fast,
                 "d" => card_data.fsrs_difficulty,
                 "dr" => card_data.fsrs_desired_retention,
                 _ => panic!("invalid key: {key}"),
@@ -358,7 +397,7 @@ fn add_extract_fsrs_retrievability(db: &Connection) -> rusqlite::Result<()> {
             };
             let decay = card_data.decay.unwrap_or(FSRS5_DEFAULT_DECAY);
             let retrievability = card_data.memory_state().map(|state| {
-                fsrs::current_retrievability(state.into(), seconds_elapsed as f32 / 86_400.0, decay)
+                current_retrievability(state.into(), seconds_elapsed as f32 / 86_400.0, decay)
             });
             Ok(retrievability)
         },
@@ -427,7 +466,7 @@ fn add_extract_fsrs_relative_retrievability(db: &Connection) -> rusqlite::Result
                                 secs_elapsed
                             };
 
-                        let current_retrievability = fsrs::current_retrievability(
+                        let current_retrievability = current_retrievability(
                             state.into(),
                             seconds_elapsed as f32 / 86_400.0,
                             decay,
@@ -479,7 +518,7 @@ impl SqliteStorage {
         server: bool,
         check_integrity: bool,
     ) -> Result<Self> {
-        let db = open_or_create_collection_db(path)?;
+        let db = open_or_create_collection_db(path, !check_integrity)?;
         let (create, ver) = schema_version(&db)?;
 
         let err = match ver {
@@ -541,6 +580,11 @@ impl SqliteStorage {
 
         if create || upgrade {
             storage.commit_trx()?;
+        }
+
+        if storage.migrate_review_retrievability_cache_to_sidecar()? > 0 {
+            storage.mark_review_retrievability_cache_cleanup_full_sync()?;
+            storage.set_schema_modified_time(TimestampMillis::now())?;
         }
 
         Ok(storage)

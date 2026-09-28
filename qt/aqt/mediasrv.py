@@ -12,12 +12,14 @@ import re
 import secrets
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from errno import EPROTOTYPE
 from http import HTTPStatus
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Generic, cast
 
 import flask
@@ -29,7 +31,16 @@ from waitress.server import create_server
 import aqt
 import aqt.main
 import aqt.operations
-from anki import frontend_pb2, generic_pb2, hooks
+import aqt.rwkv_scheduler
+from anki import (
+    decks_pb2,
+    frontend_pb2,
+    generic_pb2,
+    hooks,
+    image_occlusion_pb2,
+    notes_pb2,
+)
+from anki.cards import CardId
 from anki.collection import (
     NestedOpChanges,
     OpChanges,
@@ -39,12 +50,14 @@ from anki.collection import (
 )
 from anki.decks import UpdateDeckConfigs, UpdateDeckConfigsMode
 from anki.scheduler.v3 import SchedulingStatesWithContext, SetSchedulingStatesRequest
+from anki.stats_pb2 import CardStatsResponse, GraphsRequest
 from anki.utils import dev_mode, from_json_bytes, to_json_bytes
+from aqt import gui_hooks
 from aqt.changenotetype import ChangeNotetypeDialog
 from aqt.deckoptions import DeckOptionsDialog
 from aqt.operations import on_op_finished
 from aqt.operations.deck import update_deck_configs as update_deck_configs_op
-from aqt.progress import ProgressUpdate
+from aqt.progress import ProgressBarUpdate, ProgressUpdate
 from aqt.qt import *
 from aqt.utils import (
     aqt_data_path,
@@ -60,6 +73,12 @@ waitress.wasyncore._DISCONNECTED = waitress.wasyncore._DISCONNECTED.union({EPROT
 
 logger = logging.getLogger(__name__)
 app = flask.Flask(__name__, root_path="/fake")
+RWKV_STATS_PENDING_HEADER = "X-Anki-Rwkv-Stats-Pending"
+_QUIET_DEBUG_REQUEST_PATHS = frozenset(
+    {
+        "_anki/latestProgress",
+    }
+)
 
 
 @dataclass
@@ -121,6 +140,9 @@ def _legacy_editor_content_security_policy(port: int) -> str:
         f"http://127.0.0.1:{port}/_addons/",
     )
     return _untrusted_page_content_security_policy(" ".join(csp_paths))
+
+
+_editor_content_security_policy = _legacy_editor_content_security_policy
 
 
 _SVELTEKIT_CSP_META_RE = re.compile(
@@ -503,7 +525,8 @@ def handle_request(pathin: str) -> Response:
             abort(403)
 
     req = _extract_request(pathin)
-    logger.debug("%s /%s", flask.request.method, pathin)
+    if _should_log_request(pathin):
+        logger.debug("%s /%s", flask.request.method, pathin)
 
     try:
         if isinstance(req, NotFound):
@@ -521,6 +544,10 @@ def handle_request(pathin: str) -> Response:
         return _text_response(HTTPStatus.FORBIDDEN, str(exc))
 
 
+def _should_log_request(pathin: str) -> bool:
+    return pathin not in _QUIET_DEBUG_REQUEST_PATHS
+
+
 def get_sveltekit_route(path: str) -> str | None:
     page_name = path.split("/", maxsplit=1)[0]
     if page_name in [
@@ -529,6 +556,7 @@ def get_sveltekit_route(path: str) -> str | None:
         "card-info",
         "change-notetype",
         "deck-options",
+        "dynamic-desired-retention-plot",
         "import-anki-package",
         "import-csv",
         "import-page",
@@ -656,25 +684,61 @@ def get_deck_configs_for_update() -> bytes:
     return aqt.mw.col._backend.get_deck_configs_for_update_raw(request.data)
 
 
-def _on_update_deck_configs_success(input: UpdateDeckConfigs) -> None:
+def _on_update_deck_configs_success(
+    input: UpdateDeckConfigs, *, close_on_success: bool
+) -> None:
     is_compute_all = (
         input.mode == UpdateDeckConfigsMode.UPDATE_DECK_CONFIGS_MODE_COMPUTE_ALL_PARAMS
     )
     if not is_compute_all and isinstance(
         window := aqt.mw.app.activeModalWidget(), DeckOptionsDialog
     ):
-        window.reject()
+        if close_on_success:
+            window.reject()
+        else:
+            window.web.eval("anki.deckOptionsSaved();")
 
 
-def update_deck_configs() -> bytes:
+def _update_deck_configs(*, close_on_success: bool) -> bytes:
     # the regular change tracking machinery expects to be started on the main
     # thread and uses a callback on success, so we need to run this op on
     # main, and return immediately from the web request
 
     input = UpdateDeckConfigs()
     input.ParseFromString(request.data)
+    completed_preset_names: set[str] = set()
+    preset_log: list[str] = []
+    zero_review_skip_logged = False
+    first_progress_at: float | None = None
+    smoothed_remaining: float | None = None
+    preset_started_at: dict[str, float] = {}
+
+    def format_elapsed_time(seconds: float) -> str:
+        seconds = int(max(seconds, 0))
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m {seconds:02d}s"
+        if minutes:
+            return f"{minutes}m {seconds:02d}s"
+        return f"{seconds}s"
+
+    def review_weighted_progress(progress: Any) -> tuple[int, float]:
+        total_reviews = sum(
+            preset.reviews for preset in progress.presets if not preset.skipped
+        )
+        completed_reviews = 0.0
+        for preset in progress.presets:
+            if preset.skipped:
+                continue
+            if preset.finished:
+                completed_reviews += preset.reviews
+            elif preset.total:
+                completed_reviews += preset.reviews * preset.current / preset.total
+        return total_reviews, completed_reviews
 
     def on_progress(progress: Progress, update: ProgressUpdate) -> None:
+        nonlocal first_progress_at, smoothed_remaining, zero_review_skip_logged
         if progress.HasField("compute_memory"):
             val = progress.compute_memory
             update.max = val.total_cards
@@ -693,10 +757,78 @@ def update_deck_configs() -> bytes:
                 reviews = tr.deck_config_percent_of_reviews(
                     pct=pct, reviews=val2.reviews
                 )
+                reviews += (
+                    f" (long-term: {val2.long_term_reviews}, "
+                    f"same-day: {val2.short_term_reviews})"
+                )
             else:
                 reviews = tr.qt_misc_processing()
 
             update.label = label + "\n" + reviews
+        elif progress.HasField("compute_all_params"):
+            val3 = progress.compute_all_params
+            now = time.monotonic()
+            if first_progress_at is None:
+                first_progress_at = now
+            update.max = max(val3.total, 1)
+            update.value = val3.current
+            pct = str(int(val3.current / val3.total * 100) if val3.total > 0 else 0)
+            total_reviews, completed_reviews = review_weighted_progress(val3)
+            elapsed = now - first_progress_at
+            label_parts = [
+                f"Optimizing presets: {val3.current}/{val3.total} ({pct}%)",
+                f"elapsed: {format_elapsed_time(elapsed)}",
+            ]
+            if 0 < completed_reviews < total_reviews:
+                remaining = (
+                    elapsed * (total_reviews - completed_reviews) / completed_reviews
+                )
+                if smoothed_remaining is None:
+                    smoothed_remaining = remaining
+                else:
+                    smoothed_remaining = smoothed_remaining * 0.85 + remaining * 0.15
+                label_parts.append(
+                    f"remaining: {format_elapsed_time(smoothed_remaining)}"
+                )
+            update.label = " | ".join(label_parts)
+            skipped_count = sum(1 for preset in val3.presets if preset.skipped)
+            if skipped_count and not zero_review_skip_logged:
+                preset_log.append(f"[SKIP] {skipped_count} Presets with 0 reviews")
+                zero_review_skip_logged = True
+            for preset in val3.presets:
+                if not preset.finished and not preset.skipped and preset.total > 0:
+                    preset_started_at.setdefault(preset.name, now)
+                if preset.name in completed_preset_names:
+                    continue
+                if preset.skipped:
+                    completed_preset_names.add(preset.name)
+                elif preset.finished:
+                    started_at = preset_started_at.get(preset.name, first_progress_at)
+                    duration = format_elapsed_time(now - started_at)
+                    preset_log.append(
+                        f"[DONE] {preset.name} - {duration} "
+                        f"({preset.reviews} reviews, "
+                        f"long-term: {preset.long_term_reviews}, "
+                        f"same-day: {preset.short_term_reviews})"
+                    )
+                    completed_preset_names.add(preset.name)
+            update.details = "\n".join(preset_log[-12:]) if preset_log else None
+            update.bars = [
+                ProgressBarUpdate(
+                    label=f"{preset.name} ({preset.reviews} reviews)",
+                    value=preset.current if preset.total else int(preset.finished),
+                    max=max(preset.total, 1),
+                )
+                for preset in sorted(
+                    (
+                        preset
+                        for preset in val3.presets
+                        if not preset.finished and preset.total > 0
+                    ),
+                    key=lambda preset: preset.reviews,
+                    reverse=True,
+                )
+            ]
         else:
             return
         if update.user_wants_abort:
@@ -704,11 +836,21 @@ def update_deck_configs() -> bytes:
 
     def handle_on_main() -> None:
         update_deck_configs_op(parent=aqt.mw, input=input).success(
-            lambda _: _on_update_deck_configs_success(input)
+            lambda _: _on_update_deck_configs_success(
+                input, close_on_success=close_on_success
+            )
         ).with_backend_progress(on_progress).run_in_background()
 
     aqt.mw.taskman.run_on_main(handle_on_main)
     return b""
+
+
+def update_deck_configs() -> bytes:
+    return _update_deck_configs(close_on_success=False)
+
+
+def update_deck_configs_and_close() -> bytes:
+    return _update_deck_configs(close_on_success=True)
 
 
 def get_scheduling_states_with_context() -> bytes:
@@ -1119,6 +1261,63 @@ def open_cards_dialog() -> bytes:
     return b""
 
 
+def build_rwkv_state_cache() -> bytes:
+    aqt.rwkv_scheduler.build_rwkv_state_cache_with_progress(
+        aqt.mw,
+        record_retrievability_cache=False,
+    )
+    return b""
+
+
+def force_build_rwkv_state_cache() -> bytes:
+    aqt.rwkv_scheduler.build_rwkv_state_cache_with_progress(
+        aqt.mw,
+        force_rebuild=True,
+        record_retrievability_cache=False,
+    )
+    return b""
+
+
+def recompute_rwkv_calibration_data() -> bytes:
+    aqt.rwkv_scheduler.recompute_rwkv_calibration_data_with_progress(aqt.mw)
+    return b""
+
+
+def reschedule_rwkv_review_cards() -> bytes:
+    deck_id_request = decks_pb2.DeckId()
+    deck_id_request.ParseFromString(request.data)
+    deck_id = deck_id_request.did or None
+    aqt.rwkv_scheduler.reschedule_rwkv_review_cards_with_progress(
+        aqt.mw,
+        deck_id=deck_id,
+    )
+    return b""
+
+
+def simulate_rwkv_workload() -> bytes:
+    return aqt.rwkv_scheduler.simulate_rwkv_workload_bytes(request.data)
+
+
+def start_rwkv_workload() -> bytes:
+    return aqt.rwkv_scheduler.start_rwkv_workload_bytes(request.data)
+
+
+def rwkv_workload_result() -> Response | bytes:
+    result = aqt.rwkv_scheduler.rwkv_workload_result_bytes()
+    if result is None:
+        return _text_response(HTTPStatus.ACCEPTED, "")
+    return result
+
+
+def cancel_rwkv_workload() -> bytes:
+    aqt.rwkv_scheduler.cancel_rwkv_workload()
+    return b""
+
+
+def rwkv_workload_progress() -> bytes:
+    return aqt.rwkv_scheduler.rwkv_workload_progress_bytes()
+
+
 def save_custom_colours() -> bytes:
     colors = [
         QColorDialog.customColor(i).name(QColor.NameFormat.HexRgb)
@@ -1128,10 +1327,107 @@ def save_custom_colours() -> bytes:
     return b""
 
 
+def card_stats() -> bytes:
+    start = time.monotonic()
+    hook_count = gui_hooks.card_info_will_add_rows.count()
+    reviewer = getattr(aqt.mw, "reviewer", None) or SimpleNamespace(mw=aqt.mw)
+    backend_start = time.monotonic()
+    raw_output = aqt.mw.col._backend.card_stats_raw(request.data)
+    backend_elapsed_ms = (time.monotonic() - backend_start) * 1000
+    response: CardStatsResponse | None = None
+    card: Any | None = None
+    if hook_count == 0 and not aqt.rwkv_scheduler.has_reviewer_prediction(reviewer):
+        response = CardStatsResponse()
+        response.ParseFromString(raw_output)
+        card = aqt.mw.col.get_card(CardId(response.card_id))
+        if not aqt.rwkv_scheduler.rwkv_review_active(reviewer, card):
+            logger.debug(
+                "card stats served: hook_count=%s backend_elapsed_ms=%.1f elapsed_ms=%.1f",
+                hook_count,
+                backend_elapsed_ms,
+                (time.monotonic() - start) * 1000,
+            )
+            return raw_output
+        aqt.rwkv_scheduler.has_reviewer_backend()
+
+    if response is None:
+        response = CardStatsResponse()
+        response.ParseFromString(raw_output)
+
+    from aqt.browser.card_info import CardInfoRow
+
+    rows: list[CardInfoRow] = []
+    if card is None:
+        card = aqt.mw.col.get_card(CardId(response.card_id))
+    for label, value in aqt.rwkv_scheduler.rwkv_card_info_rows(
+        reviewer=reviewer,
+        card=card,
+        fallback_source=_card_stats_fallback_retrievability_source(response),
+    ):
+        rows.append(CardInfoRow(label=label, value=value))
+
+    hook_start = time.monotonic()
+    gui_hooks.card_info_will_add_rows(rows, card)
+    hook_elapsed_ms = (time.monotonic() - hook_start) * 1000
+
+    for row in rows:
+        response.extra_rows.add(label=row.label, value=row.value)
+
+    logger.debug(
+        "card stats served: card_id=%s hook_count=%s extra_rows=%s backend_elapsed_ms=%.1f "
+        "hook_elapsed_ms=%.1f elapsed_ms=%.1f",
+        response.card_id,
+        hook_count,
+        len(rows),
+        backend_elapsed_ms,
+        hook_elapsed_ms,
+        (time.monotonic() - start) * 1000,
+    )
+    return response.SerializeToString()
+
+
+def _card_stats_fallback_retrievability_source(response: CardStatsResponse) -> str:
+    return "FSRS" if response.HasField("memory_state") else "SM2"
+
+
+def graphs() -> Response:
+    start = time.monotonic()
+    request_proto = GraphsRequest()
+    request_proto.ParseFromString(request.data)
+    reviewer = getattr(aqt.mw, "reviewer", None) or SimpleNamespace(mw=aqt.mw)
+    prepare_start = time.monotonic()
+    prepare_status = aqt.rwkv_scheduler.prepare_stats_retrievability_scores(
+        reviewer,
+        request_proto.search,
+        wait_for_warmup=False,
+    )
+    prepare_elapsed_ms = (time.monotonic() - prepare_start) * 1000
+    backend_start = time.monotonic()
+    output = raw_backend_request("graphs")()
+    backend_elapsed_ms = (time.monotonic() - backend_start) * 1000
+    response = flask.make_response(output)
+    response.headers["Content-Type"] = "application/binary"
+    if prepare_status == aqt.rwkv_scheduler.RwkvStatsPreparationStatus.PENDING:
+        response.headers[RWKV_STATS_PENDING_HEADER] = "1"
+    logger.debug(
+        "graphs served: search=%r days=%s rwkv_prepare_status=%s prepare_elapsed_ms=%.1f "
+        "backend_elapsed_ms=%.1f response_bytes=%s elapsed_ms=%.1f",
+        request_proto.search,
+        request_proto.days,
+        prepare_status.value,
+        prepare_elapsed_ms,
+        backend_elapsed_ms,
+        len(output),
+        (time.monotonic() - start) * 1000,
+    )
+    return response
+
+
 post_handler_list = [
     congrats_info,
     get_deck_configs_for_update,
     update_deck_configs,
+    update_deck_configs_and_close,
     get_scheduling_states_with_context,
     set_scheduling_states,
     change_notetype,
@@ -1140,6 +1436,15 @@ post_handler_list = [
     search_in_browser,
     deck_options_require_close,
     deck_options_ready,
+    build_rwkv_state_cache,
+    force_build_rwkv_state_cache,
+    recompute_rwkv_calibration_data,
+    reschedule_rwkv_review_cards,
+    simulate_rwkv_workload,
+    start_rwkv_workload,
+    rwkv_workload_result,
+    cancel_rwkv_workload,
+    rwkv_workload_progress,
     get_profile_config_json,
     set_profile_config_json,
     get_meta_json,
@@ -1161,6 +1466,8 @@ post_handler_list = [
     open_fields_dialog,
     open_cards_dialog,
     save_custom_colours,
+    card_stats,
+    graphs,
 ]
 
 
@@ -1196,9 +1503,7 @@ exposed_backend_list = [
     "get_change_notetype_info",
     "get_cloze_field_ords",
     # StatsService
-    "card_stats",
     "get_review_logs",
-    "graphs",
     "get_graph_preferences",
     "set_graph_preferences",
     # TagsService
@@ -1212,11 +1517,18 @@ exposed_backend_list = [
     # SchedulerService
     "compute_fsrs_params",
     "compute_optimal_retention",
+    "get_fsrs_new_card_intervals",
     "set_wants_abort",
+    "evaluate_params",
     "evaluate_params_legacy",
     "get_optimal_retention_parameters",
     "simulate_fsrs_review",
     "simulate_fsrs_workload",
+    "fsrs_next_interval",
+    "fsrs_interval_at_retrievability",
+    "fsrs_interval_at_retrievability_batch",
+    "fsrs_interval_at_retrievability_variable_batch",
+    "fsrs_interval_at_retrievability_by_config_batch",
     # DeckConfigService
     "get_ignored_before_count",
     "get_retention_workload",
@@ -1245,7 +1557,25 @@ def raw_backend_request(endpoint: str) -> Callable[[], bytes]:
     assert hasattr(RustBackend, f"{endpoint}_raw")
 
     def wrapped() -> bytes:
-        output = getattr(aqt.mw.col._backend, f"{endpoint}_raw")(request.data)
+        raw_request = request.data
+
+        def mutation() -> bytes:
+            return getattr(
+                aqt.mw.col._backend,
+                f"{endpoint}_raw",
+            )(raw_request)
+
+        rwkv_note_ids = _rwkv_raw_backend_mutation_note_ids(endpoint, raw_request)
+        output = (
+            aqt.rwkv_scheduler.run_collection_mutation_preserving_rwkv_state(
+                aqt.mw.col,
+                mutation,
+                note_ids=rwkv_note_ids,
+                force_reconciliation=True,
+            )
+            if rwkv_note_ids is not None
+            else mutation()
+        )
         op_changes_type = int(request.headers.get("Anki-Op-Changes", "0"))
         if op_changes_type:
             op_message_types = (OpChanges, OpChangesOnly, NestedOpChanges)
@@ -1267,6 +1597,23 @@ def raw_backend_request(endpoint: str) -> Callable[[], bytes]:
         return output
 
     return wrapped
+
+
+def _rwkv_raw_backend_mutation_note_ids(
+    endpoint: str,
+    data: bytes,
+) -> tuple[int, ...] | None:
+    if endpoint in {"add_note", "add_image_occlusion_note"}:
+        return ()
+    if endpoint == "update_notes":
+        update = notes_pb2.UpdateNotesRequest()
+        update.ParseFromString(data)
+        return tuple(note.id for note in update.notes)
+    if endpoint == "update_image_occlusion_note":
+        update_image = image_occlusion_pb2.UpdateImageOcclusionNoteRequest()
+        update_image.ParseFromString(data)
+        return (update_image.note_id,)
+    return None
 
 
 # all methods in here require a collection
@@ -1292,7 +1639,9 @@ def _extract_collection_post_request(path: str) -> DynamicRequest | NotFound:
                 else:
                     result = handler()
                     data = result
-                if data:
+                if isinstance(data, Response):
+                    response = data
+                elif data:
                     response = flask.make_response(data)
                     response.headers["Content-Type"] = "application/binary"
                 else:

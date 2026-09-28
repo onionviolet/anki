@@ -41,6 +41,9 @@ def make_form(prefs: PreferencesProto) -> MagicMock:
     form.showEstimates.isChecked.return_value = (
         prefs.reviewing.show_intervals_on_buttons
     )
+    form.showFuzzDelta.isChecked.return_value = (
+        prefs.reviewing.show_fuzz_delta_on_buttons
+    )
     form.timeLimit.value.return_value = int(prefs.reviewing.time_limit_secs / 60)
     form.showPlayButtons.isChecked.return_value = (
         not prefs.reviewing.hide_audio_play_buttons

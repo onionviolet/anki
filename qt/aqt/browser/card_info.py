@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from google.protobuf.json_format import MessageToDict
 
@@ -23,6 +26,14 @@ from aqt.utils import (
     tr,
 )
 from aqt.webview import AnkiWebView, AnkiWebViewKind
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CardInfoRow:
+    label: str
+    value: str
 
 
 class CardInfoDialog(QDialog):
@@ -123,6 +134,8 @@ class CardInfoDialog(QDialog):
         tooltip(tr.about_copied_to_clipboard())
 
     def update_card(self, card_id: CardId | None) -> None:
+        start = time.monotonic()
+        requested_card_id = card_id
         try:
             self.mw.col.get_card(card_id)
         except NotFoundError:
@@ -130,6 +143,12 @@ class CardInfoDialog(QDialog):
 
         assert self.web is not None
         self.web.eval(f"anki.updateCard('{card_id}');")
+        logger.debug(
+            "card info update requested: requested_card_id=%s card_id=%s elapsed_ms=%.1f",
+            requested_card_id,
+            card_id,
+            (time.monotonic() - start) * 1000,
+        )
 
     def reject(self) -> None:
         if self._on_close:

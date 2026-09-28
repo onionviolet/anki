@@ -1,6 +1,8 @@
 # Personal Anki fork
 
-This fork keeps Anki's scheduler and collection format intact while adding small study tools to the desktop reviewer. The upstream project is [Ankitects Anki](https://github.com/ankitects/anki).
+This fork combines [Ankitects Anki](https://github.com/ankitects/anki) 26.09.3 with the experimental FSRS7/RWKV work from [JSchoreels/anki](https://github.com/JSchoreels/anki) and the study tools below. FSRS7 and RWKV change scheduling when enabled. RWKV is desktop-only; other clients continue using their supported scheduler. Back up a collection before enabling experimental scheduling.
+
+The imported UI work includes simulator workload comparisons, clearer limited deck counts, the current-deck Browser search, and fixes for IME text committed while an editor field closes. The imported build also supports an isolated portable app. The bundled AnkiConnect server retains the official application version to avoid the FSRS7 fork's version-suffix parsing issue.
 
 ## Included feature
 
@@ -22,4 +24,4 @@ The fork bundles the pinned Chinese Support 3 add-on from `integrations/chinese-
 
 ## Local verification
 
-An isolated fork launch with a separate single-instance key, base folder, and API port returned AnkiConnect v6, one default deck, and zero notes through the bundled `ankictl` client. The `aqt` wheel contains the client, server source, and license. The Rust bridge loaded after rebuilding with Rust 1.98.1; Rust 1.97.1 generated a misaligned `LINKEDIT` string pool rejected by macOS 27, matching [rust-lang/rust#157750](https://github.com/rust-lang/rust/issues/157750). The fork pins 1.98.1. `just check` passed with the repository's `CONTRIBUTORS_BYPASS_EMAILS` setting for this fork author: 184 pylib tests, 130 Qt tests, 672 Rust tests, 71 TypeScript tests, and formatting, typing, and lint checks. The fork is not installed over the daily Anki app.
+The merge was validated in an isolated worktree. `just check` passed with the repository's `CONTRIBUTORS_BYPASS_EMAILS` setting for this fork author: 1,111 Rust tests, 741 Qt tests, 200 pylib tests, and the web build, format, type, and lint checks. `just test-e2e` finished with 38 passed and one skipped. `just portable` produced a macOS archive containing the Rust bridge, `ankictl`, AnkiConnect, Chinese Support source, and RWKV assets. The archive was extracted and launched with an isolated profile, but native first-run verification could not finish while the Mac was locked. This build has not been installed over the daily Anki app or tested against its collection.

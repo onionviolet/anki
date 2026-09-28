@@ -15,6 +15,7 @@ use super::parser::SearchNode;
 use super::parser::StateKind;
 use super::parser::TemplateKind;
 use super::ReturnItemType;
+use super::RWKV_DUE_TABLE;
 use crate::card::CardQueue;
 use crate::card::CardType;
 use crate::collection::Collection;
@@ -42,6 +43,8 @@ pub(crate) struct SqlWriter<'a> {
     args: Vec<String>,
     normalize_note_text: bool,
     table: RequiredTable,
+    card_id_filter_table: Option<&'static str>,
+    first_grade_table: Option<&'static str>,
 }
 
 impl SqlWriter<'_> {
@@ -56,7 +59,19 @@ impl SqlWriter<'_> {
             args,
             normalize_note_text,
             table: item_type.required_table(),
+            card_id_filter_table: None,
+            first_grade_table: None,
         }
+    }
+
+    pub(super) fn with_card_id_filter_table(mut self, table: &'static str) -> Self {
+        self.card_id_filter_table = Some(table);
+        self
+    }
+
+    pub(super) fn with_first_grade_table(mut self, table: &'static str) -> Self {
+        self.first_grade_table = Some(table);
+        self
     }
 
     pub(super) fn build_query(
@@ -71,17 +86,39 @@ impl SqlWriter<'_> {
     }
 
     fn write_table_sql(&mut self) {
-        let sql = match self.table {
-            RequiredTable::Cards => "select c.id from cards c where ",
-            RequiredTable::Notes => "select n.id from notes n where ",
-            _ => match self.item_type {
-                ReturnItemType::Cards => "select c.id from cards c, notes n where c.nid=n.id and ",
-                ReturnItemType::Notes => {
-                    "select distinct n.id from cards c, notes n where c.nid=n.id and "
+        if let Some(filter_table) = self.card_id_filter_table {
+            let sql = match self.table {
+                RequiredTable::Cards => {
+                    format!("select c.id from {filter_table} sc, cards c where sc.cid=c.id and ")
                 }
-            },
-        };
-        self.sql.push_str(sql);
+                RequiredTable::Notes => format!(
+                    "select n.id from {filter_table} sc, cards c, notes n where sc.cid=c.id and c.nid=n.id and "
+                ),
+                _ => match self.item_type {
+                    ReturnItemType::Cards => format!(
+                        "select c.id from {filter_table} sc, cards c, notes n where sc.cid=c.id and c.nid=n.id and "
+                    ),
+                    ReturnItemType::Notes => format!(
+                        "select distinct n.id from {filter_table} sc, cards c, notes n where sc.cid=c.id and c.nid=n.id and "
+                    ),
+                },
+            };
+            self.sql.push_str(&sql);
+        } else {
+            let sql = match self.table {
+                RequiredTable::Cards => "select c.id from cards c where ",
+                RequiredTable::Notes => "select n.id from notes n where ",
+                _ => match self.item_type {
+                    ReturnItemType::Cards => {
+                        "select c.id from cards c, notes n where c.nid=n.id and "
+                    }
+                    ReturnItemType::Notes => {
+                        "select distinct n.id from cards c, notes n where c.nid=n.id and "
+                    }
+                },
+            };
+            self.sql.push_str(sql);
+        }
     }
 
     /// As an optimization we can omit the cards or notes tables from
@@ -142,6 +179,26 @@ impl SqlWriter<'_> {
             SearchNode::SingleField { field, text, mode } => {
                 self.write_field(&norm(field), &self.norm_note(text), *mode)?
             }
+            SearchNode::NumericField {
+                field,
+                operator,
+                value,
+            } => {
+                let comparisons = [(operator.as_str(), *value)];
+                self.write_numeric_field(&norm(field), &comparisons)?
+            }
+            SearchNode::NumericFieldRange {
+                field,
+                min,
+                max,
+                min_inclusive,
+                max_inclusive,
+            } => {
+                let min_op = if *min_inclusive { ">=" } else { ">" };
+                let max_op = if *max_inclusive { "<=" } else { "<" };
+                let comparisons = [(min_op, *min), (max_op, *max)];
+                self.write_numeric_field(&norm(field), &comparisons)?
+            }
             SearchNode::Duplicates { notetype_id, text } => {
                 self.write_dupe(*notetype_id, &self.norm_note(text))?
             }
@@ -180,6 +237,7 @@ impl SqlWriter<'_> {
             SearchNode::DeckIdWithChildren(did) => self.write_deck_id_with_children(*did)?,
             SearchNode::Notetype(notetype) => self.write_notetype(&norm(notetype)),
             SearchNode::Rated { days, ease } => self.write_rated(">", -i64::from(*days), ease)?,
+            SearchNode::FirstGrade(button) => self.write_first_grade(*button),
 
             SearchNode::Tag { tag, mode } => self.write_tag(&norm(tag), *mode),
             SearchNode::State(state) => self.write_state(state)?,
@@ -201,6 +259,31 @@ impl SqlWriter<'_> {
             }
         };
         Ok(())
+    }
+
+    fn write_first_grade(&mut self, button: u8) {
+        if let Some(table) = self.first_grade_table {
+            write!(
+                self.sql,
+                "c.id in (select cid from {table} where ease = {button})"
+            )
+            .unwrap();
+        } else {
+            write!(
+                self.sql,
+                "exists (
+                select 1 from revlog r
+                where r.cid = c.id
+                and r.ease = {button}
+                and r.id = (
+                    select min(first.id) from revlog first
+                    where first.cid = c.id
+                    and first.ease between 1 and 4
+                )
+            )"
+            )
+            .unwrap();
+        }
     }
 
     fn write_unqualified(
@@ -426,25 +509,30 @@ impl SqlWriter<'_> {
                 self.args.push(value.clone());
                 write!(self.sql, "extract_custom_data(c.data, ?) {op} ?").unwrap();
             }
-            PropertyKind::Stability(s) => {
-                write!(self.sql, "extract_fsrs_variable(c.data, 's') {op} {s}").unwrap()
-            }
+            PropertyKind::Stability(s) => write!(
+                self.sql,
+                "(select s90 from search_exact_retrievability where cid = c.id) {op} {s}"
+            )
+            .unwrap(),
             PropertyKind::Difficulty(d) => {
                 let d = d * 9.0 + 1.0;
                 write!(self.sql, "extract_fsrs_variable(c.data, 'd') {op} {d}").unwrap()
             }
-            PropertyKind::Retrievability(r) => {
-                let (elap, next_day_at, now) = {
-                    let timing = self.col.timing_today()?;
-                    (timing.days_elapsed, timing.next_day_at, timing.now)
-                };
-                const NEW_TYPE: i8 = CardType::New as i8;
-                write!(
-                    self.sql,
-                    "case when c.type = {NEW_TYPE} then false else (extract_fsrs_retrievability(c.data, case when c.odue !=0 then c.odue else c.due end, c.ivl, {elap}, {next_day_at}, {now}) {op} {r}) end"
-                )
-                .unwrap()
-            }
+            PropertyKind::Retrievability(r) => write!(
+                self.sql,
+                "(select fsrs_r from search_exact_retrievability where cid = c.id) {op} {r}"
+            )
+            .unwrap(),
+            PropertyKind::RwkvRetrievability(r) => write!(
+                self.sql,
+                "(select rwkv_r from search_exact_retrievability where cid = c.id) {op} {r}"
+            )
+            .unwrap(),
+            PropertyKind::RwkvCurveRetrievability(r) => write!(
+                self.sql,
+                "(select rwkv_curve_r from search_exact_retrievability where cid = c.id) {op} {r}"
+            )
+            .unwrap(),
         }
 
         Ok(())
@@ -492,6 +580,16 @@ impl SqlWriter<'_> {
                 lrn = CardQueue::Learn as i8,
                 previewrepeat = CardQueue::PreviewRepeat as i8,
                 learncutoff = TimestampSecs::now().0 + (self.col.learn_ahead_secs() as i64),
+            ),
+            StateKind::RwkvDue => write!(
+                self.sql,
+                "exists (select 1 from {RWKV_DUE_TABLE} rd \
+                 where rd.cid = c.id and rd.kind = 0)"
+            ),
+            StateKind::RwkvCurveDue => write!(
+                self.sql,
+                "exists (select 1 from {RWKV_DUE_TABLE} rd \
+                 where rd.cid = c.id and rd.kind = 1)"
             ),
             StateKind::UserBuried => write!(self.sql, "c.queue = {}", CardQueue::UserBuried as i8),
             StateKind::SchedBuried => {
@@ -729,6 +827,40 @@ impl SqlWriter<'_> {
             .iter()
             .map(notetype_clause)
             .join(" or ");
+        write!(self.sql, "({all_notetype_clauses})").unwrap();
+
+        Ok(())
+    }
+
+    fn write_numeric_field(&mut self, field_name: &str, comparisons: &[(&str, f64)]) -> Result<()> {
+        let field_indices_by_notetype = self.fields_indices_by_notetype(field_name)?;
+        if field_indices_by_notetype.is_empty() {
+            write!(self.sql, "false").unwrap();
+            return Ok(());
+        }
+
+        self.args
+            .push(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$".into());
+        let arg_idx = self.args.len();
+
+        let all_notetype_clauses = field_indices_by_notetype
+            .iter()
+            .map(|(mid, field_indices)| {
+                let field_clauses = field_indices
+                    .iter()
+                    .map(|idx| {
+                        let field = format!("trim(field_at_index(n.flds, {idx}))");
+                        let comparisons = comparisons
+                            .iter()
+                            .map(|(op, value)| format!("cast({field} as real) {op} {value}"))
+                            .join(" and ");
+                        format!("({field} regexp ?{arg_idx} and {comparisons})")
+                    })
+                    .join(" or ");
+                format!("(n.mid = {mid} and ({field_clauses}))")
+            })
+            .join(" or ");
+
         write!(self.sql, "({all_notetype_clauses})").unwrap();
 
         Ok(())
@@ -1091,6 +1223,7 @@ impl SearchNode {
             SearchNode::DeckIdsWithoutChildren(_) => RequiredTable::Cards,
             SearchNode::DeckIdWithChildren(_) => RequiredTable::Cards,
             SearchNode::Rated { .. } => RequiredTable::Cards,
+            SearchNode::FirstGrade(_) => RequiredTable::Cards,
             SearchNode::State(_) => RequiredTable::Cards,
             SearchNode::Flag(_) => RequiredTable::Cards,
             SearchNode::CardIds(_) => RequiredTable::Cards,
@@ -1101,6 +1234,8 @@ impl SearchNode {
 
             SearchNode::UnqualifiedText(_) => RequiredTable::Notes,
             SearchNode::SingleField { .. } => RequiredTable::Notes,
+            SearchNode::NumericField { .. } => RequiredTable::Notes,
+            SearchNode::NumericFieldRange { .. } => RequiredTable::Notes,
             SearchNode::Tag { .. } => RequiredTable::Notes,
             SearchNode::Duplicates { .. } => RequiredTable::Notes,
             SearchNode::Regex(_) => RequiredTable::Notes,
@@ -1340,6 +1475,11 @@ mod test {
             )
         );
         assert_eq!(s(ctx, "rated:0").0, s(ctx, "rated:1").0);
+        let first_grade_sql = s(ctx, "firstgrade:2").0;
+        assert!(first_grade_sql.contains("r.ease = 2"));
+        assert!(first_grade_sql.contains("r.cid = c.id"));
+        assert!(first_grade_sql.contains("first.cid = c.id"));
+        assert!(first_grade_sql.contains("first.ease between 1 and 4"));
 
         // resched
         assert_eq!(
@@ -1364,6 +1504,15 @@ c.odue != 0 then c.odue else c.due end) != {days}) or (c.queue in (1,4) and
             )
         );
         assert_eq!(s(ctx, "prop:rated>-5:3").0, s(ctx, "rated:5:3").0);
+        assert!(s(ctx, "prop:r<0.9")
+            .0
+            .contains("select fsrs_r from search_exact_retrievability"));
+        assert!(s(ctx, "prop:rwkv:r>=0.8")
+            .0
+            .contains("select rwkv_r from search_exact_retrievability"));
+        assert!(s(ctx, "prop:rwkv-curve:r=0.7")
+            .0
+            .contains("select rwkv_curve_r from search_exact_retrievability"));
         assert_eq!(
             s(ctx, "prop:cdn:r=1"),
             (
@@ -1464,7 +1613,11 @@ c.odue != 0 then c.odue else c.due end) != {days}) or (c.queue in (1,4) and
         let mut reviewed_note = nt.new_note();
         col.add_note(&mut reviewed_note, DeckId(1))?;
         let reviewed_cid = col.storage.card_ids_of_notes(&[reviewed_note.id]).unwrap()[0];
-        col.grade_now(&[reviewed_cid], 3)?;
+        col.grade_now(anki_proto::scheduler::GradeNowRequest {
+            card_ids: vec![reviewed_cid.into()],
+            rating: anki_proto::scheduler::card_answer::Rating::Easy as i32,
+            card_options: vec![],
+        })?;
 
         let mut new_note = nt.new_note();
         col.add_note(&mut new_note, DeckId(1))?;

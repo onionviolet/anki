@@ -24,6 +24,7 @@ use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 
 use crate::card::CardQueue;
+use crate::collection::Collection;
 use crate::collection::CollectionBuilder;
 use crate::deckconfig::DeckConfig;
 use crate::decks::DeckKind;
@@ -52,6 +53,9 @@ use crate::sync::http_server::SyncServerConfig;
 use crate::sync::login::HostKeyRequest;
 use crate::sync::login::SyncAuth;
 use crate::sync::request::IntoSyncRequest;
+
+const FSRS_REVIEW_RETRIEVABILITY_CACHE_TABLE: &str = "search_stats_fsrs_review_retrievability";
+const RWKV_REVIEW_RETRIEVABILITY_CACHE_TABLE: &str = "search_stats_rwkv_review_retrievability";
 
 struct TestAuth {
     username: String,
@@ -122,6 +126,46 @@ fn unwrap_sync_err_kind(err: AnkiError) -> SyncErrorKind {
         panic!("not sync err: {err:?}");
     };
     kind
+}
+
+fn main_table_exists(col: &Collection, table: &str) -> Result<bool> {
+    col.storage
+        .db
+        .prepare("SELECT null FROM main.sqlite_master WHERE type = 'table' AND name = ?")?
+        .exists([table])
+        .map_err(Into::into)
+}
+
+fn add_legacy_retrievability_cache_tables(col: &Collection) -> Result<()> {
+    col.storage.db.execute_batch(&format!(
+        "
+        CREATE TABLE main.{FSRS_REVIEW_RETRIEVABILITY_CACHE_TABLE} (
+            revlog_id INTEGER NOT NULL,
+            prediction REAL NOT NULL,
+            source TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            sample_role TEXT NOT NULL DEFAULT 'final_fit',
+            fold_index INTEGER NOT NULL DEFAULT -1,
+            PRIMARY KEY (revlog_id, sample_role, fold_index, source)
+        );
+        INSERT INTO main.{FSRS_REVIEW_RETRIEVABILITY_CACHE_TABLE}
+            (revlog_id, prediction, source, updated_at, sample_role, fold_index)
+        VALUES (1, 0.25, 'legacy_fsrs', 123, 'validation_fold', 2);
+        CREATE TABLE main.{RWKV_REVIEW_RETRIEVABILITY_CACHE_TABLE} (
+            revlog_id INTEGER NOT NULL,
+            prediction REAL NOT NULL,
+            source TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            sample_role TEXT NOT NULL DEFAULT 'final_fit',
+            fold_index INTEGER NOT NULL DEFAULT -1,
+            PRIMARY KEY (revlog_id, sample_role, fold_index, source)
+        );
+        INSERT INTO main.{RWKV_REVIEW_RETRIEVABILITY_CACHE_TABLE}
+            (revlog_id, prediction, source, updated_at, sample_role, fold_index)
+        VALUES (2, 0.75, 'legacy_rwkv', 456, 'test_fold', 0);
+        "
+    ))?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -326,6 +370,44 @@ async fn new_empty_collection_should_not_require_full_sync() -> Result<()> {
             state.required,
             SyncActionRequired::FullSyncRequired { .. }
         ));
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn check_database_legacy_retrievability_cache_cleanup_reaches_server() -> Result<()> {
+    with_active_server(|client| async move {
+        let ctx = SyncTestContext::new(client);
+        upload_download(&ctx).await?;
+
+        let mut col1 = ctx.col1();
+        add_legacy_retrievability_cache_tables(&col1)?;
+        col1.check_database()?;
+
+        let out = ctx.normal_sync(&mut col1).await;
+        assert_eq!(
+            out.required,
+            SyncActionRequired::FullSyncRequired {
+                upload_ok: true,
+                download_ok: true,
+            }
+        );
+        ctx.full_upload(col1).await;
+
+        let col2 = ctx.col2();
+        ctx.full_download(col2).await;
+
+        let col2 = ctx.col2();
+        assert!(!main_table_exists(
+            &col2,
+            FSRS_REVIEW_RETRIEVABILITY_CACHE_TABLE
+        )?);
+        assert!(!main_table_exists(
+            &col2,
+            RWKV_REVIEW_RETRIEVABILITY_CACHE_TABLE
+        )?);
 
         Ok(())
     })
@@ -634,6 +716,11 @@ async fn regular_sync(ctx: &SyncTestContext) -> Result<()> {
         name: "new dconf".into(),
         ..Default::default()
     };
+    dconf.inner.review_fuzz_base = None;
+    dconf.inner.review_fuzz_factor_short = None;
+    dconf.inner.review_fuzz_factor_mid = None;
+    dconf.inner.review_fuzz_factor_long = None;
+    dconf.inner.review_fuzz_enabled = None;
     col1.add_or_update_deck_config(&mut dconf)?;
     if let DeckKind::Normal(deck) = &mut deck.kind {
         deck.config_id = dconf.id.0;
@@ -681,10 +768,16 @@ async fn regular_sync(ctx: &SyncTestContext) -> Result<()> {
 
     let out = ctx.normal_sync(&mut col1).await;
     assert_eq!(out.required, SyncActionRequired::NoChanges);
+    assert!(!out.remote_collection_changed);
+    assert!(out.remote_review_ids.is_empty());
+    assert!(!out.remote_non_review_collection_changed);
 
     // sync the other collection
     let out = ctx.normal_sync(&mut col2).await;
     assert_eq!(out.required, SyncActionRequired::NoChanges);
+    assert!(out.remote_collection_changed);
+    assert_eq!(out.remote_review_ids, vec![RevlogId(123)]);
+    assert!(out.remote_non_review_collection_changed);
 
     let ntid = nt.id;
     let deckid = deck.id;
@@ -747,6 +840,23 @@ async fn regular_sync(ctx: &SyncTestContext) -> Result<()> {
 
     // make sure everything has been transferred across
     compare_sides(&mut col1, &mut col2)?;
+
+    // A review-only download is reported separately from other collection changes.
+    col1.storage.add_revlog_entry(
+        &RevlogEntry {
+            id: RevlogId(124),
+            cid: CardId(456),
+            usn: Usn(-1),
+            interval: 11,
+            ..Default::default()
+        },
+        true,
+    )?;
+    ctx.normal_sync(&mut col1).await;
+    let out = ctx.normal_sync(&mut col2).await;
+    assert!(out.remote_collection_changed);
+    assert_eq!(out.remote_review_ids, vec![RevlogId(124)]);
+    assert!(!out.remote_non_review_collection_changed);
 
     // make some modifications
     let mut note = col2.storage.get_note(note.id)?.unwrap();

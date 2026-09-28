@@ -2,7 +2,7 @@
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 import { FsrsMemoryState } from "@generated/anki/cards_pb";
-import { CardStatsResponse } from "@generated/anki/stats_pb";
+import { CardStatsResponse, CardStatsResponse_CardInfoRow } from "@generated/anki/stats_pb";
 import * as tr2 from "@generated/ftl";
 import { expect, test } from "vitest";
 
@@ -61,4 +61,36 @@ test("with memoryState and fsrs enabled, shows FSRS rows and hides ease", () => 
         value: "70%",
     });
     expect(rows.find((row) => row.label === tr2.cardStatsEase())).toBeUndefined();
+});
+
+test("keeps RWKV comparison rows together after FSRS retrievability", () => {
+    const rows = rowsFromStats(
+        baseStats({
+            desiredRetention: 0.9,
+            fsrsRetrievability: 0.8,
+            memoryState: new FsrsMemoryState({ stability: 20, difficulty: 7.3 }),
+            extraRows: [
+                new CardStatsResponse_CardInfoRow({ label: "Other", value: "last" }),
+                new CardStatsResponse_CardInfoRow({
+                    label: "Retrievability source",
+                    value: "RWKV",
+                }),
+                new CardStatsResponse_CardInfoRow({ label: "RWKV computed R", value: "79%" }),
+                new CardStatsResponse_CardInfoRow({
+                    label: "RWKV : Answer Button Probability",
+                    value: "Again 5%",
+                }),
+            ],
+        }),
+    );
+
+    const labels = rows.map((row) => row.label);
+    const fsrsIndex = labels.indexOf(tr2.cardStatsFsrsComputedR());
+    expect(labels.slice(fsrsIndex, fsrsIndex + 4)).toEqual([
+        tr2.cardStatsFsrsComputedR(),
+        "RWKV computed R",
+        "RWKV : Answer Button Probability",
+        "Retrievability source",
+    ]);
+    expect(labels.indexOf("Other")).toBeGreaterThan(labels.indexOf("Retrievability source"));
 });

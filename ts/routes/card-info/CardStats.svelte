@@ -7,7 +7,6 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     import { rowsFromStats, type StatsRow } from "./lib";
 
     export let stats: CardStatsResponse;
-
     let statsRows: StatsRow[];
     $: statsRows = rowsFromStats(stats);
 </script>
