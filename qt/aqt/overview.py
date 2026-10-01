@@ -9,7 +9,8 @@ from typing import Any
 
 import aqt
 import aqt.operations
-from anki.collection import OpChanges
+import aqt.rwkv_scheduler
+from anki.collection import Collection, OpChanges
 from anki.scheduler import UnburyDeck
 from aqt import gui_hooks
 from aqt.deckdescription import DeckDescriptionDialog
@@ -56,6 +57,8 @@ class Overview:
         self.web = mw.web
         self.bottom = BottomBar(mw, mw.bottomWeb)
         self._refresh_needed = False
+        self._rwkv_count_generation = 0
+        self._rwkv_counts_pending = False
 
     def show(self) -> None:
         av_player.stop_and_clear_queue()
@@ -64,16 +67,35 @@ class Overview:
         self.refresh()
 
     def refresh(self) -> None:
-        def success(_counts: tuple) -> None:
+        self._rwkv_count_generation += 1
+        generation = self._rwkv_count_generation
+
+        def success(rwkv_counts_pending: bool) -> None:
+            if generation != self._rwkv_count_generation:
+                return
             self._refresh_needed = False
+            self._rwkv_counts_pending = rwkv_counts_pending
             self._renderPage()
             self._renderBottom()
             self.mw.web.setFocus()
             gui_hooks.overview_did_refresh(self)
+            aqt.rwkv_scheduler.request_rwkv_state_cache_recovery(
+                self.mw,
+                reason="overview",
+            )
 
-        QueryOp(
-            parent=self.mw, op=lambda col: col.sched.counts(), success=success
-        ).run_in_background()
+        def get_counts(col: Collection) -> bool:
+            rwkv_counts_pending = aqt.rwkv_scheduler.rwkv_state_cache_loading(self.mw)
+            aqt.rwkv_scheduler.prepare_current_deck_review_queue_scores(
+                self.mw,
+                reason="overview counts",
+            )
+            col.sched.counts()
+            return rwkv_counts_pending or (
+                aqt.rwkv_scheduler.rwkv_state_cache_loading(self.mw)
+            )
+
+        QueryOp(parent=self.mw, op=get_counts, success=success).run_in_background()
 
     def refresh_if_needed(self) -> None:
         if self._refresh_needed:
@@ -226,21 +248,31 @@ class Overview:
         return f'<div class="descfont descmid description {dyn}">{desc}</div>'
 
     def _table(self) -> str:
-        counts = list(self.mw.col.sched.counts())
+        new_count, learning_count, review_count = self.mw.col.sched.counts()
+        counts: list[int | str] = [new_count, learning_count, review_count]
         current_did = self.mw.col.decks.get_current_id()
         deck_node = self.mw.col.sched.deck_due_tree(current_did)
 
         but = self.mw.button
         if self.mw.col.v3_scheduler():
             assert deck_node is not None
-            buried_new = deck_node.new_count - counts[0]
-            buried_learning = deck_node.learn_count - counts[1]
-            buried_review = deck_node.review_count - counts[2]
+            buried_new = deck_node.new_count - new_count
+            buried_learning = deck_node.learn_count - learning_count
+            if self._rwkv_counts_pending:
+                counts[2] = "…"
+                buried_review = 0
+            else:
+                buried_review = deck_node.review_count - review_count
         else:
             buried_new = buried_learning = buried_review = 0
         buried_label = tr.studying_counts_differ()
 
-        def number_row(title: str, klass: str, count: int, buried_count: int) -> str:
+        def number_row(
+            title: str,
+            klass: str,
+            count: int | str,
+            buried_count: int,
+        ) -> str:
             buried = f"{buried_count:+}" if buried_count else ""
             return f"""
 <tr>

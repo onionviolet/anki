@@ -84,6 +84,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         resetIOImage,
     } from "../image-occlusion/mask-editor";
     import { ChangeTimer } from "$lib/editable/change-timer";
+    import { commitCurrentComposition } from "$lib/sveltelib/composition";
     import { clearableArray } from "./destroyable";
     import DuplicateLink from "./DuplicateLink.svelte";
     import EditorToolbar from "./editor-toolbar";
@@ -444,6 +445,9 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     }
 
     async function saveNow() {
+        await commitCurrentComposition();
+        await tick();
+        await focusEventQueue.run(() => {});
         closeMathjaxEditor?.();
         $commitTagEdits();
         await saveFieldNow();

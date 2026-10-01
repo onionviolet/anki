@@ -15,6 +15,7 @@ unit-testing
 testing-coverage
 sonarcloud
 architecture
+rwkv
 protobuf
 ```
 

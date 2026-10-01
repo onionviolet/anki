@@ -88,9 +88,9 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     }
 </script>
 
-<TitledContainer title={"FSRS"}>
+<TitledContainer title={"Scheduler"}>
     <HelpModal
-        title={"FSRS"}
+        title={"Scheduler"}
         url={HelpPage.DeckOptions.fsrs}
         slot="tooltip"
         fsrs={$fsrs}

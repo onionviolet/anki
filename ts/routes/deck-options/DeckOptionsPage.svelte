@@ -3,6 +3,7 @@ Copyright: Ankitects Pty Ltd and contributors
 License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 -->
 <script lang="ts">
+    import { createEventDispatcher } from "svelte";
     import type { Writable } from "svelte/store";
 
     import "$lib/sveltelib/export-runtime";
@@ -24,10 +25,12 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     import LapseOptions from "./LapseOptions.svelte";
     import type { DeckOptionsState } from "./lib";
     import NewOptions from "./NewOptions.svelte";
+    import RwkvOptions from "./RwkvOptions.svelte";
     import TimerOptions from "./TimerOptions.svelte";
     import EasyDays from "./EasyDays.svelte";
 
     export let state: DeckOptionsState;
+    const dispatch = createEventDispatcher<{ close: void }>();
     const addons = state.addonComponents;
 
     export function auxData(): Writable<Record<string, unknown>> {
@@ -73,7 +76,11 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     }
 </script>
 
-<ConfigSelector {state} on:presetchange={onPresetChange} />
+<ConfigSelector
+    {state}
+    on:presetchange={onPresetChange}
+    on:close={() => dispatch("close")}
+/>
 
 <div class="deck-options-page">
     <Container
@@ -109,6 +116,10 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                     api={{}}
                     bind:this={fsrsOptionsOuterComponent}
                 />
+            </Row>
+
+            <Row class="row-columns">
+                <RwkvOptions {state} {onPresetChange} />
             </Row>
         </div>
 

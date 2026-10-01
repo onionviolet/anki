@@ -7,6 +7,7 @@
 
 import { protoBase64 } from "@bufbuild/protobuf";
 import {
+    DeckConfig_Config_FsrsVersion,
     DeckConfig_Config_LeechAction,
     DeckConfigsForUpdate,
     UpdateDeckConfigsMode,
@@ -75,8 +76,9 @@ const exampleData = {
         },
     ],
     currentDeck: {
-        name: "Default::child",
+        name: "Default::\"child\"",
         configId: 1618570764780n,
+        subtreeConfigIds: [1n, 1618570764780n],
     },
     defaults: {
         config: {
@@ -100,15 +102,20 @@ const exampleData = {
 };
 
 function startingState(): DeckOptionsState {
-    return new DeckOptionsState(
-        123n,
-        new DeckConfigsForUpdate(exampleData),
-    );
+    return new DeckOptionsState(123n, new DeckConfigsForUpdate(exampleData));
 }
 
 test("start", () => {
     const state = startingState();
-    expect(state.currentDeck.name).toBe("Default::child");
+    expect(state.currentDeck.name).toBe("Default::\"child\"");
+});
+
+test("subtree presets and search names", () => {
+    const state = startingState();
+    expect(state.getSubtreeConfigIds()).toStrictEqual([1n, 1618570764780n]);
+    expect(state.getConfigById(1n)?.name).toBe("Default");
+    expect(state.getCurrentNameForSearch()).toBe("another one");
+    expect(state.getCurrentDeckNameForSearch()).toBe("Default::\\\"child\\\"");
 });
 
 test("deck list", () => {
@@ -234,6 +241,14 @@ test("saving", () => {
     expect(out.configs!.length).toBe(1);
     expect(out.configs![0].name).toBe("another one");
     expect(out.mode).toBe(UpdateDeckConfigsMode.NORMAL);
+    expect(out.fsrsShortTermWithStepsEnabled).toBe(false);
+    expect(out.fsrsLearningQueuesDisabled).toBe(false);
+
+    state.fsrsShortTermWithStepsEnabled.set(true);
+    state.fsrsLearningQueuesDisabled.set(true);
+    out = state.dataForSaving(UpdateDeckConfigsMode.NORMAL);
+    expect(out.fsrsShortTermWithStepsEnabled).toBe(true);
+    expect(out.fsrsLearningQueuesDisabled).toBe(true);
 
     // rename, then change current deck
     state.setCurrentName("zzz");
@@ -263,6 +278,33 @@ test("saving", () => {
     out = state.dataForSaving(UpdateDeckConfigsMode.APPLY_TO_CHILDREN);
     expect(out.removedConfigIds).toStrictEqual([1618570764780n]);
     expect(out.configs!.map((c) => c.name)).toStrictEqual(["Default"]);
+});
+
+test("clears incompatible FSRS params across presets for optimize all", () => {
+    const state = startingState();
+    const defaultConfig = state.getConfigById(1n)!;
+    const otherConfig = state.getConfigById(1618570764780n)!;
+
+    defaultConfig.config!.fsrsVersion = DeckConfig_Config_FsrsVersion.SEVEN;
+    defaultConfig.config!.fsrsParams7 = Array(35).fill(1);
+    otherConfig.config!.fsrsVersion = DeckConfig_Config_FsrsVersion.SIX;
+    otherConfig.config!.fsrsParams6 = [Number.NaN, ...Array(20).fill(1)];
+
+    expect(state.incompatibleFsrsParamPresetNames()).toStrictEqual([
+        "another one",
+        "Default",
+    ]);
+    expect(state.clearIncompatibleFsrsParams()).toBe(2);
+    expect(state.incompatibleFsrsParamPresetNames()).toStrictEqual([]);
+    expect(get(state.currentConfig).fsrsParams6).toStrictEqual([]);
+
+    const out = state.dataForSaving(UpdateDeckConfigsMode.COMPUTE_ALL_PARAMS);
+    expect(out.configs!.map((config) => config.name)).toStrictEqual([
+        "Default",
+        "another one",
+    ]);
+    expect(out.configs![0].config!.fsrsParams7).toStrictEqual([]);
+    expect(out.configs![1].config!.fsrsParams6).toStrictEqual([]);
 });
 
 test("aux data", () => {

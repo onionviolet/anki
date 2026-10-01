@@ -5,12 +5,14 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 <script lang="ts">
     import {
         ComputeRetentionProgress,
+        ComputeParamsProgress_Phase,
         type ComputeParamsProgress,
     } from "@generated/anki/collection_pb";
-    import { SimulateFsrsReviewRequest } from "@generated/anki/scheduler_pb";
     import {
         computeFsrsParams,
+        evaluateParams,
         evaluateParamsLegacy,
+        getFsrsNewCardIntervals,
         getRetentionWorkload,
         setWantsAbort,
     } from "@generated/backend";
@@ -21,13 +23,65 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     import SwitchRow from "$lib/components/SwitchRow.svelte";
 
     import GlobalLabel from "./GlobalLabel.svelte";
-    import { commitEditing, fsrsParams, type DeckOptionsState, ValueTab } from "./lib";
+    import {
+        commitEditing,
+        type DeckOptionsState,
+        fsrsParamsForEvaluation,
+        ValueTab,
+        withSelectedFsrsParams,
+    } from "./lib";
     import SpinBoxFloatRow from "./SpinBoxFloatRow.svelte";
     import Warning from "./Warning.svelte";
     import ParamsInputRow from "./ParamsInputRow.svelte";
     import ParamsSearchRow from "./ParamsSearchRow.svelte";
+    import DynamicDesiredRetentionPlotModal from "./DynamicDesiredRetentionPlotModal.svelte";
     import SimulatorModal from "./SimulatorModal.svelte";
     import {
+        deltaClass,
+        formatDelta,
+        formatMetric,
+        formatPercentDelta,
+        metricDelta,
+        metricDeltaPercent,
+    } from "./optimize-comparison";
+    import {
+        customDecayCandidates,
+        formatDecay,
+        supportsCustomDecayTable,
+        withLastParam,
+    } from "./custom-decay-table";
+    import {
+        readFsrs7SameDaySettings,
+        withFsrs7SameDaySettings,
+    } from "./fsrs-same-day-settings";
+    import {
+        readFsrs7SchedulingPenaltySettings,
+        withFsrs7SchedulingPenaltySettings,
+    } from "./fsrs-scheduling-penalty-settings";
+    import {
+        readFsrsSearchSettings,
+        withFsrsSearchSettings,
+    } from "./fsrs-search-settings";
+    import {
+        fsrsParamDiagnostics,
+        fsrsParamsSupportSameDayEvaluation,
+        fsrsSameDayEvaluationOverrideForComparison,
+        OUTDATED_FSRS7_PREVIEW_PARAMS_WARNING,
+        type FsrsParamDiagnostics,
+    } from "./fsrs-param-diagnostics";
+    import {
+        costWeightForAverageDr,
+        dynamicDesiredRetentionEnabled,
+        schedulingTargetDr,
+        targetDrCalibration,
+        validCalibration,
+        validOptionalFixedTargetCalibration,
+        validPolicyParams,
+        validRetentionBounds,
+    } from "./dynamic-desired-retention";
+    import {
+        DeckConfig_Config,
+        DeckConfig_Config_FsrsVersion,
         GetRetentionWorkloadRequest,
         type GetRetentionWorkloadResponse,
         UpdateDeckConfigsMode,
@@ -36,6 +90,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     import TabbedValue from "./TabbedValue.svelte";
     import Item from "$lib/components/Item.svelte";
     import DynamicallySlottable from "$lib/components/DynamicallySlottable.svelte";
+    import { buildSimulateFsrsRequest } from "./simulate-fsrs-request";
 
     export let state: DeckOptionsState;
     export let openHelpModal: (String) => void;
@@ -56,6 +111,14 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     const config = state.currentConfig;
     const defaults = state.defaults;
     const fsrsReschedule = state.fsrsReschedule;
+    const fsrsShortTermWithStepsEnabled = state.fsrsShortTermWithStepsEnabled;
+    const fsrsLearningQueuesDisabled = state.fsrsLearningQueuesDisabled;
+    const reviewFuzzEnabled = state.reviewFuzzEnabled;
+    const reviewFuzzBase = state.reviewFuzzBase;
+    const reviewFuzzFactorShort = state.reviewFuzzFactorShort;
+    const reviewFuzzFactorMid = state.reviewFuzzFactorMid;
+    const reviewFuzzFactorLong = state.reviewFuzzFactorLong;
+    const auxData = state.currentAuxData;
     const daysSinceLastOptimization = state.daysSinceLastOptimization;
     const limits = state.deckLimits;
 
@@ -64,7 +127,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     let desiredRetentionFocused = false;
     let desiredRetentionEverFocused = false;
     let optimized = false;
-    const initialParams = [...fsrsParams($config)];
+    const initialParams = [...selectedFsrsParams($config)];
     $: if (desiredRetentionFocused) {
         desiredRetentionEverFocused = true;
     }
@@ -74,17 +137,307 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     let computeParamsProgress: ComputeParamsProgress | undefined;
     let computingParams = false;
     let checkingParams = false;
+    let checkingHealth = false;
+    type OptimizationMetrics = {
+        logLoss: number;
+        rmseBins: number;
+    };
+    type OptimizationComparison = {
+        optimizedParams: number[];
+        dynamicDesiredRetentionParams: number[];
+        dynamicDesiredRetentionWeights: number[];
+        dynamicDesiredRetentionAvgDrs: number[];
+        dynamicDesiredRetentionFsrsEqWeights: number[];
+        dynamicDesiredRetentionFsrsEqDrs: number[];
+        dynamicDesiredRetentionFixedTargetWeights: number[];
+        dynamicDesiredRetentionFixedTargetDrs: number[];
+        dynamicDesiredRetentionMin: number;
+        dynamicDesiredRetentionMax: number;
+        search: string;
+        ignoreRevlogsBeforeMs: bigint;
+        includeSameDayReviews: boolean | undefined;
+        current: OptimizationMetrics;
+        optimized: OptimizationMetrics;
+    };
+    type DecayRow = {
+        decay: number;
+        isBaseline: boolean;
+        logLoss: number;
+        rmseBins: number;
+        logLossDelta: number;
+        logLossDeltaPercent: number | undefined;
+        rmseDelta: number;
+        rmseDeltaPercent: number | undefined;
+    };
+    type SameDayDecisionRow = {
+        label: string;
+        fsrsItems: number;
+        allTargets: OptimizationMetrics;
+        longTermTargets: OptimizationMetrics;
+    };
+    type SameDayParamsCandidate = {
+        label: string;
+        fsrsItems: number;
+        params: number[];
+    };
+    type FsrsParamRole = "current" | "optimized";
+
+    class FsrsOptimizationFeedbackError extends Error {}
+    type SameDayDecisionComparison = {
+        withSameDay: SameDayDecisionRow;
+        withoutSameDay: SameDayDecisionRow;
+    };
+    type SameDayRecommendation = {
+        tone: "better" | "worse" | "equal";
+        text: string;
+    };
+    let optimizationComparison: OptimizationComparison | undefined;
+    let sameDayDecisionComparison: SameDayDecisionComparison | undefined;
+    let customDecayRows: DecayRow[] = [];
+    let loadingCustomDecayTable = false;
+    let evaluationSearchFilter = "";
+    let includeSameDayReviewsInFsrs7 = true;
+    let enableSchedulingPenaltiesInFsrs7 = false;
+    let checkingSameDayDecision = false;
+    $: evaluationSearchFilter = readFsrsSearchSettings($auxData).evaluationSearch;
+    $: {
+        const updated = withFsrsSearchSettings($auxData, {
+            evaluationSearch: evaluationSearchFilter,
+        });
+        if (updated) {
+            auxData.set(updated);
+        }
+    }
+    $: {
+        const settings = readFsrs7SameDaySettings($auxData);
+        includeSameDayReviewsInFsrs7 = settings.includeSameDayReviews;
+    }
+    $: {
+        const updated = withFsrs7SameDaySettings($auxData, {
+            includeSameDayReviews: includeSameDayReviewsInFsrs7,
+        });
+        if (updated) {
+            auxData.set(updated);
+        }
+    }
+    $: {
+        const settings = readFsrs7SchedulingPenaltySettings($auxData);
+        enableSchedulingPenaltiesInFsrs7 = settings.enableSchedulingPenalties;
+    }
+    $: {
+        const updated = withFsrs7SchedulingPenaltySettings($auxData, {
+            enableSchedulingPenalties: enableSchedulingPenaltiesInFsrs7,
+        });
+        if (updated) {
+            auxData.set(updated);
+        }
+    }
+    const fsrsVersionChoices = [
+        {
+            value: DeckConfig_Config_FsrsVersion.SEVEN,
+            label: "FSRS-7",
+        },
+        {
+            value: DeckConfig_Config_FsrsVersion.SIX,
+            label: "FSRS-6",
+        },
+        {
+            value: DeckConfig_Config_FsrsVersion.FIVE,
+            label: "FSRS-5",
+        },
+        {
+            value: DeckConfig_Config_FsrsVersion.FOUR,
+            label: "FSRS-4.5",
+        },
+    ];
+
+    function selectedFsrsParams(config: DeckConfig_Config): number[] {
+        switch (config.fsrsVersion) {
+            case DeckConfig_Config_FsrsVersion.SIX:
+                return config.fsrsParams6;
+            case DeckConfig_Config_FsrsVersion.FIVE:
+                return config.fsrsParams5;
+            case DeckConfig_Config_FsrsVersion.FOUR:
+                return config.fsrsParams4;
+            default:
+                return config.fsrsParams7;
+        }
+    }
+
+    function setSelectedFsrsParams(params: number[]): void {
+        config.update((current) => withSelectedFsrsParams(current, params));
+    }
+
+    function errorMessage(err: unknown): string {
+        return err instanceof Error ? err.message : String(err);
+    }
+
+    function isInterrupted(err: unknown): boolean {
+        return errorMessage(err) === "500: Interrupted";
+    }
+
+    function isInvalidFsrsParametersError(err: unknown): boolean {
+        return errorMessage(err).includes(tr.deckConfigInvalidParameters());
+    }
+
+    function fsrsParamDiagnosticDetails(diagnostics: FsrsParamDiagnostics): string {
+        if (diagnostics.outdatedFsrs7PreviewParams) {
+            return OUTDATED_FSRS7_PREVIEW_PARAMS_WARNING;
+        }
+        if (!diagnostics.validCount) {
+            return `Expected 0, 17, 19, 21, or 34 values, but found ${diagnostics.count}.`;
+        }
+        if (diagnostics.nonFiniteIndexes.length) {
+            const positions = diagnostics.nonFiniteIndexes
+                .slice(0, 5)
+                .map((index) => index + 1)
+                .join(", ");
+            return `Non-finite value at position ${positions}.`;
+        }
+        return "";
+    }
+
+    function invalidFsrsParamsFeedback(
+        role: FsrsParamRole,
+        diagnostics: FsrsParamDiagnostics,
+        rejectedByBackend = false,
+    ): string {
+        const details = fsrsParamDiagnosticDetails(diagnostics);
+        const backendDetail = rejectedByBackend
+            ? "FSRS rejected these parameters during evaluation."
+            : "";
+        const reason = [details, backendDetail].filter((text) => text).join("\n");
+        const roleMessage =
+            role === "current"
+                ? "Anki cannot evaluate the current FSRS parameters, so it cannot compare them with the optimized parameters."
+                : "Anki cannot evaluate the optimized FSRS parameters, so it cannot show the optimization comparison.";
+        let nextStep = "Please report this with the console details.";
+        if (role === "current") {
+            nextStep = diagnostics.outdatedFsrs7PreviewParams
+                ? ""
+                : "Leave the FSRS parameters field blank to use the default values, then optimize again.";
+        }
+
+        return [
+            roleMessage,
+            reason,
+            nextStep,
+            "Details have been logged to the console.",
+        ]
+            .filter((text) => text)
+            .join("\n\n");
+    }
+
+    function logFsrsParamProblem(
+        reason: string,
+        role: FsrsParamRole,
+        params: number[],
+        err?: unknown,
+    ): void {
+        const details = {
+            params,
+            diagnostics: fsrsParamDiagnostics(params),
+            fsrsVersion: $config.fsrsVersion,
+            includeSameDayReviews: includeSameDayOverride(),
+            enableSchedulingPenalties: enableSchedulingPenaltiesOverride(),
+            dynamicDesiredRetentionEnabled: $config.fsrsDynamicDesiredRetentionEnabled,
+            search: optimizeSearchFilter(),
+            evaluationSearch: evaluateSearchFilter(),
+            ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs().toString(),
+            error: err ? errorMessage(err) : undefined,
+        };
+        console.warn(
+            `FSRS ${role} parameter ${reason}: ${JSON.stringify(details)}`,
+            err,
+        );
+    }
+
+    function requireValidFsrsParams(role: FsrsParamRole, params: number[]): void {
+        const diagnostics = fsrsParamDiagnostics(params);
+        if (diagnostics.valid) {
+            return;
+        }
+        logFsrsParamProblem("validation failed before backend call", role, params);
+        throw new FsrsOptimizationFeedbackError(
+            invalidFsrsParamsFeedback(role, diagnostics),
+        );
+    }
+
+    async function evaluateParamsLegacyForOptimization(
+        role: FsrsParamRole,
+        input: Parameters<typeof evaluateParamsLegacy>[0],
+    ): ReturnType<typeof evaluateParamsLegacy> {
+        requireValidFsrsParams(role, input.params);
+        try {
+            return await evaluateParamsLegacy(input, { alertOnError: false });
+        } catch (err) {
+            logFsrsParamProblem("backend evaluation failed", role, input.params, err);
+            if (isInvalidFsrsParametersError(err)) {
+                throw new FsrsOptimizationFeedbackError(
+                    invalidFsrsParamsFeedback(
+                        role,
+                        fsrsParamDiagnostics(input.params),
+                        true,
+                    ),
+                );
+            }
+            throw err;
+        }
+    }
+
+    function optimizationFailureFeedback(err: unknown, params: number[]): string {
+        if (err instanceof FsrsOptimizationFeedbackError) {
+            return err.message;
+        }
+
+        const diagnostics = fsrsParamDiagnostics(params);
+        if (isInvalidFsrsParametersError(err) && !diagnostics.valid) {
+            logFsrsParamProblem(
+                "backend rejected current parameters",
+                "current",
+                params,
+                err,
+            );
+            return invalidFsrsParamsFeedback("current", diagnostics, true);
+        }
+
+        console.warn(
+            "FSRS optimization failed",
+            {
+                params,
+                diagnostics,
+                fsrsVersion: $config.fsrsVersion,
+                includeSameDayReviews: includeSameDayOverride(),
+                dynamicDesiredRetentionEnabled:
+                    $config.fsrsDynamicDesiredRetentionEnabled,
+                search: optimizeSearchFilter(),
+                evaluationSearch: evaluateSearchFilter(),
+                ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs().toString(),
+                error: errorMessage(err),
+            },
+            err,
+        );
+
+        const dynamicDesiredRetentionHint =
+            $config.fsrsVersion === DeckConfig_Config_FsrsVersion.SEVEN &&
+            $config.fsrsDynamicDesiredRetentionEnabled
+                ? "\n\nDynamic DR (ADR) is enabled. Try disabling it and optimizing again to check whether it is involved."
+                : "";
+        return `FSRS optimization failed. Details have been logged to the console.${dynamicDesiredRetentionHint}\n\n${errorMessage(err)}`;
+    }
 
     const healthCheck = state.fsrsHealthCheck;
 
-    $: computing = computingParams || checkingParams;
+    $: computing =
+        computingParams || checkingParams || checkingHealth || checkingSameDayDecision;
     $: defaultparamSearch = `preset:"${state.getCurrentNameForSearch()}" -is:suspended`;
     $: roundedRetention = Number(effectiveDesiredRetention.toFixed(2));
     $: desiredRetentionWarning = getRetentionLongShortWarning(roundedRetention);
 
     let desiredRetentionChangeInfo = "";
+    let desiredRetentionChangeClass = "alert-info two-line";
     $: if (showDesiredRetentionTooltip) {
-        getRetentionChangeInfo(roundedRetention, fsrsParams($config));
+        getRetentionChangeInfo(roundedRetention, selectedFsrsParams($config));
     }
 
     $: retentionWarningClass = getRetentionWarningClass(roundedRetention);
@@ -113,21 +466,63 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     let effectiveDesiredRetention =
         $limits.desiredRetention ?? $config.desiredRetention;
     const startingDesiredRetention = effectiveDesiredRetention.toFixed(2);
+    const startingDesiredRetentionValue = Number(startingDesiredRetention);
+    const intervalColumns = [
+        tr.studyingAgain(),
+        tr.studyingHard(),
+        tr.studyingGood(),
+        tr.studyingEasy(),
+        tr.deckConfigAgainThenGood(),
+        tr.deckConfigAgainThenAgain(),
+        tr.deckConfigGoodThenAgain(),
+        tr.deckConfigGoodThenGood(),
+    ];
+    const intervalRowClasses = [
+        "interval-again",
+        "interval-hard",
+        "interval-good",
+        "interval-easy",
+        "",
+        "",
+        "",
+        "",
+    ];
+    let newCardIntervals: [string[], string[]] | undefined;
+    let newCardIntervalsError = "";
+    let newCardIntervalRequest = 0;
 
-    $: simulateFsrsRequest = new SimulateFsrsReviewRequest({
-        params: fsrsParams($config),
-        desiredRetention: $config.desiredRetention,
-        newLimit: $config.newPerDay,
-        reviewLimit: $config.reviewsPerDay,
-        maxInterval: $config.maximumReviewInterval,
+    $: simulateFsrsRequest = buildSimulateFsrsRequest({
+        config: $config,
+        params: selectedFsrsParams($config),
         search: `preset:"${state.getCurrentNameForSearch()}" -is:suspended`,
         newCardsIgnoreReviewLimit: $newCardsIgnoreReviewLimit,
-        easyDaysPercentages: $config.easyDaysPercentages,
-        reviewOrder: $config.reviewOrder,
-        historicalRetention: $config.historicalRetention,
-        learningStepCount: $config.learnSteps.length,
-        relearningStepCount: $config.relearnSteps.length,
+        reviewFuzzEnabled: $reviewFuzzEnabled,
+        reviewFuzzBase: $reviewFuzzBase,
+        reviewFuzzFactorShort: $reviewFuzzFactorShort,
+        reviewFuzzFactorMid: $reviewFuzzFactorMid,
+        reviewFuzzFactorLong: $reviewFuzzFactorLong,
     });
+
+    $: void loadNewCardIntervals(
+        startingDesiredRetentionValue,
+        effectiveDesiredRetention,
+        $fsrsShortTermWithStepsEnabled,
+        $fsrsLearningQueuesDisabled,
+        selectedFsrsParams($config),
+        $config.learnSteps,
+        $config.relearnSteps,
+        $config.maximumReviewInterval,
+        $config.fsrsMinimumIntervalSecs,
+        $config.graduatingIntervalGood,
+        $config.graduatingIntervalEasy,
+        $config.initialEase,
+        $config.hardMultiplier,
+        $config.easyMultiplier,
+        $config.intervalMultiplier,
+        $config.leechThreshold,
+        $config.lapseMultiplier,
+        $config.minimumLapseInterval,
+    );
 
     const DESIRED_RETENTION_LOW_THRESHOLD = 0.8;
     const DESIRED_RETENTION_HIGH_THRESHOLD = 0.95;
@@ -144,11 +539,89 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
     let retentionWorkloadInfo: undefined | Promise<GetRetentionWorkloadResponse> =
         undefined;
-    let lastParams = [...fsrsParams($config)];
+    let lastParams = [...selectedFsrsParams($config)];
+
+    function configWithDesiredRetention(
+        currentConfig: DeckConfig_Config,
+        desiredRetention: number,
+    ): DeckConfig_Config {
+        const config = new DeckConfig_Config(currentConfig);
+        config.desiredRetention = desiredRetention;
+        return config;
+    }
+
+    async function loadNewCardIntervals(
+        currentRetention: number,
+        selectedRetention: number,
+        fsrsShortTermWithStepsEnabled: boolean,
+        fsrsLearningQueuesDisabled: boolean,
+        params: number[],
+        _learnSteps: number[],
+        _relearnSteps: number[],
+        _maximumReviewInterval: number,
+        _fsrsMinimumIntervalSecs: number,
+        _graduatingIntervalGood: number,
+        _graduatingIntervalEasy: number,
+        _initialEase: number,
+        _hardMultiplier: number,
+        _easyMultiplier: number,
+        _intervalMultiplier: number,
+        _leechThreshold: number,
+        _lapseMultiplier: number,
+        _minimumLapseInterval: number,
+    ): Promise<void> {
+        const request = ++newCardIntervalRequest;
+        newCardIntervalsError = "";
+        const diagnostics = fsrsParamDiagnostics(params);
+        if (!diagnostics.valid) {
+            newCardIntervals = undefined;
+            newCardIntervalsError = fsrsParamDiagnosticDetails(diagnostics);
+            return;
+        }
+        const currentConfig = withSelectedFsrsParams($config, params);
+        try {
+            const [current, selected] = await Promise.all([
+                getFsrsNewCardIntervals({
+                    config: configWithDesiredRetention(currentConfig, currentRetention),
+                    fsrsShortTermWithStepsEnabled,
+                    fsrsLearningQueuesDisabled,
+                }),
+                getFsrsNewCardIntervals({
+                    config: configWithDesiredRetention(
+                        currentConfig,
+                        selectedRetention,
+                    ),
+                    fsrsShortTermWithStepsEnabled,
+                    fsrsLearningQueuesDisabled,
+                }),
+            ]);
+            if (request !== newCardIntervalRequest) {
+                return;
+            }
+            newCardIntervals = [current.vals, selected.vals];
+            newCardIntervalsError = "";
+        } catch (err) {
+            if (request === newCardIntervalRequest) {
+                newCardIntervals = undefined;
+                newCardIntervalsError =
+                    err instanceof Error ? err.message : String(err);
+                console.error("failed to load FSRS new-card intervals", err);
+            }
+        }
+    }
 
     async function getRetentionChangeInfo(retention: number, params: number[]) {
         if (+startingDesiredRetention == roundedRetention) {
             desiredRetentionChangeInfo = tr.deckConfigWorkloadFactorUnchanged();
+            desiredRetentionChangeClass = "alert-info two-line";
+            return;
+        }
+        const diagnostics = fsrsParamDiagnostics(params);
+        if (!diagnostics.valid) {
+            lastParams = [...params];
+            retentionWorkloadInfo = undefined;
+            desiredRetentionChangeInfo = fsrsParamDiagnosticDetails(diagnostics);
+            desiredRetentionChangeClass = "alert-warning two-line";
             return;
         }
         if (
@@ -162,18 +635,28 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                 search: defaultparamSearch,
             });
             lastParams = [...params];
-            retentionWorkloadInfo = getRetentionWorkload(request);
+            retentionWorkloadInfo = getRetentionWorkload(request, {
+                alertOnError: false,
+            });
         }
 
         const previous = +startingDesiredRetention * 100;
         const after = retention * 100;
-        const resp = await retentionWorkloadInfo;
-        const factor = resp.costs[after] / resp.costs[previous];
+        try {
+            const resp = await retentionWorkloadInfo;
+            const factor = resp.costs[after] / resp.costs[previous];
 
-        desiredRetentionChangeInfo = tr.deckConfigWorkloadFactorChange({
-            factor: factor.toFixed(2),
-            previousDr: previous.toString(),
-        });
+            desiredRetentionChangeInfo = tr.deckConfigWorkloadFactorChange({
+                factor: factor.toFixed(2),
+                previousDr: previous.toString(),
+            });
+            desiredRetentionChangeClass = "alert-info two-line";
+        } catch (err) {
+            retentionWorkloadInfo = undefined;
+            desiredRetentionChangeInfo = errorMessage(err);
+            desiredRetentionChangeClass = "alert-warning two-line";
+            console.warn("failed to load FSRS retention workload", err);
+        }
     }
 
     function getRetentionWarningClass(retention: number): string {
@@ -197,6 +680,61 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         );
     }
 
+    function getNumOfRelearningStepsInDay(): number {
+        const relearningSteps = $config.relearnSteps;
+        let numOfRelearningStepsInDay = 0;
+        let accumulatedTime = 0;
+        for (let i = 0; i < relearningSteps.length; i++) {
+            accumulatedTime += relearningSteps[i];
+            if (accumulatedTime >= 1440) {
+                break;
+            }
+            numOfRelearningStepsInDay++;
+        }
+        return numOfRelearningStepsInDay;
+    }
+
+    function optimizeSearchFilter(): string {
+        return $config.paramSearch ? $config.paramSearch : defaultparamSearch;
+    }
+
+    function evaluateSearchFilter(): string {
+        return evaluationSearchFilter.trim()
+            ? evaluationSearchFilter
+            : optimizeSearchFilter();
+    }
+
+    function includeSameDayOverride(): boolean | undefined {
+        if ($config.fsrsVersion !== DeckConfig_Config_FsrsVersion.SEVEN) {
+            return undefined;
+        }
+        return includeSameDayReviewsInFsrs7;
+    }
+
+    function enableSchedulingPenaltiesOverride(): boolean {
+        return (
+            $config.fsrsVersion === DeckConfig_Config_FsrsVersion.SEVEN &&
+            enableSchedulingPenaltiesInFsrs7
+        );
+    }
+
+    function includeSameDayOverrideForParams(params: number[]): boolean | undefined {
+        return fsrsParamsSupportSameDayEvaluation(params)
+            ? includeSameDayOverride()
+            : undefined;
+    }
+
+    function includeSameDayOverrideForComparison(
+        currentParams: number[],
+        optimizedParams: number[],
+    ): boolean | undefined {
+        return fsrsSameDayEvaluationOverrideForComparison(
+            currentParams,
+            optimizedParams,
+            includeSameDayOverride(),
+        );
+    }
+
     async function computeParams(): Promise<void> {
         if (computingParams) {
             await setWantsAbort({});
@@ -206,31 +744,36 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
             alert(tr.deckConfigPleaseSaveYourChangesFirst());
             return;
         }
+        await commitEditing();
         computingParams = true;
         computeParamsProgress = undefined;
+        const params = selectedFsrsParams($config);
+        const currentEvaluationParams = fsrsParamsForEvaluation($config, defaults);
         try {
+            requireValidFsrsParams("current", params);
             await runWithBackendProgress(
                 async () => {
-                    const params = fsrsParams($config);
-                    const RelearningSteps = $config.relearnSteps;
-                    let numOfRelearningStepsInDay = 0;
-                    let accumulatedTime = 0;
-                    for (let i = 0; i < RelearningSteps.length; i++) {
-                        accumulatedTime += RelearningSteps[i];
-                        if (accumulatedTime >= 1440) {
-                            break;
-                        }
-                        numOfRelearningStepsInDay++;
-                    }
-                    const resp = await computeFsrsParams({
-                        search: $config.paramSearch
-                            ? $config.paramSearch
-                            : defaultparamSearch,
-                        ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
-                        currentParams: params,
-                        numOfRelearningSteps: numOfRelearningStepsInDay,
-                        healthCheck: $healthCheck,
-                    });
+                    const search = optimizeSearchFilter();
+                    const evaluateSearch = evaluateSearchFilter();
+                    const resp = await computeFsrsParams(
+                        {
+                            search,
+                            ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
+                            currentParams: params,
+                            numOfRelearningSteps: getNumOfRelearningStepsInDay(),
+                            healthCheck: $healthCheck,
+                            includeSameDayReviews: includeSameDayOverride(),
+                            enableSchedulingPenalties:
+                                enableSchedulingPenaltiesOverride(),
+                            fsrsVersion: $config.fsrsVersion,
+                            dynamicDesiredRetentionEnabled:
+                                $config.fsrsVersion ===
+                                    DeckConfig_Config_FsrsVersion.SEVEN &&
+                                $config.fsrsDynamicDesiredRetentionEnabled,
+                        },
+                        { alertOnError: false },
+                    );
+                    requireValidFsrsParams("optimized", resp.params);
 
                     const alreadyOptimal =
                         (params.length &&
@@ -243,7 +786,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                     if (resp.healthCheckPassed !== undefined) {
                         healthCheckMessage = resp.healthCheckPassed
                             ? tr.deckConfigFsrsGoodFit()
-                            : tr.deckConfigFsrsBadFitWarning();
+                            : "";
                     }
                     let alreadyOptimalMessage = "";
                     if (alreadyOptimal) {
@@ -259,11 +802,95 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                         setTimeout(() => alert(message), 200);
                     }
 
+                    const dynamicDesiredRetentionParams = [
+                        ...resp.fsrsDynamicDesiredRetentionParams,
+                    ];
+                    const dynamicDesiredRetentionWeights = [
+                        ...resp.fsrsDynamicDesiredRetentionWeights,
+                    ];
+                    const dynamicDesiredRetentionAvgDrs = [
+                        ...resp.fsrsDynamicDesiredRetentionAvgDrs,
+                    ];
+                    const dynamicDesiredRetentionFsrsEqWeights = [
+                        ...resp.fsrsDynamicDesiredRetentionFsrsEqWeights,
+                    ];
+                    const dynamicDesiredRetentionFsrsEqDrs = [
+                        ...resp.fsrsDynamicDesiredRetentionFsrsEqDrs,
+                    ];
+                    const dynamicDesiredRetentionFixedTargetWeights = [
+                        ...resp.fsrsDynamicDesiredRetentionFixedTargetWeights,
+                    ];
+                    const dynamicDesiredRetentionFixedTargetDrs = [
+                        ...resp.fsrsDynamicDesiredRetentionFixedTargetDrs,
+                    ];
+                    const dynamicDesiredRetentionMin =
+                        resp.fsrsDynamicDesiredRetentionMin;
+                    const dynamicDesiredRetentionMax =
+                        resp.fsrsDynamicDesiredRetentionMax;
+                    if (alreadyOptimal && dynamicDesiredRetentionParams.length) {
+                        $config.fsrsDynamicDesiredRetentionParams =
+                            dynamicDesiredRetentionParams;
+                        $config.fsrsDynamicDesiredRetentionWeights =
+                            dynamicDesiredRetentionWeights;
+                        $config.fsrsDynamicDesiredRetentionAvgDrs =
+                            dynamicDesiredRetentionAvgDrs;
+                        $config.fsrsDynamicDesiredRetentionFsrsEqWeights =
+                            dynamicDesiredRetentionFsrsEqWeights;
+                        $config.fsrsDynamicDesiredRetentionFsrsEqDrs =
+                            dynamicDesiredRetentionFsrsEqDrs;
+                        $config.fsrsDynamicDesiredRetentionFixedTargetWeights =
+                            dynamicDesiredRetentionFixedTargetWeights;
+                        $config.fsrsDynamicDesiredRetentionFixedTargetDrs =
+                            dynamicDesiredRetentionFixedTargetDrs;
+                        $config.fsrsDynamicDesiredRetentionMin =
+                            dynamicDesiredRetentionMin;
+                        $config.fsrsDynamicDesiredRetentionMax =
+                            dynamicDesiredRetentionMax;
+                    }
+
                     if (!alreadyOptimal) {
-                        $config.fsrsParams6 = resp.params;
-                        setTimeout(() => {
-                            optimized = true;
-                        }, 201);
+                        const comparisonIncludeSameDayReviews =
+                            includeSameDayOverrideForComparison(
+                                currentEvaluationParams,
+                                resp.params,
+                            );
+                        const currentMetrics =
+                            await evaluateParamsLegacyForOptimization("current", {
+                                search: evaluateSearch,
+                                ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
+                                params: currentEvaluationParams,
+                                includeSameDayReviews: comparisonIncludeSameDayReviews,
+                            });
+                        const optimizedMetrics =
+                            await evaluateParamsLegacyForOptimization("optimized", {
+                                search: evaluateSearch,
+                                ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
+                                params: resp.params,
+                                includeSameDayReviews: comparisonIncludeSameDayReviews,
+                            });
+                        optimizationComparison = {
+                            optimizedParams: [...resp.params],
+                            dynamicDesiredRetentionParams,
+                            dynamicDesiredRetentionWeights,
+                            dynamicDesiredRetentionAvgDrs,
+                            dynamicDesiredRetentionFsrsEqWeights,
+                            dynamicDesiredRetentionFsrsEqDrs,
+                            dynamicDesiredRetentionFixedTargetWeights,
+                            dynamicDesiredRetentionFixedTargetDrs,
+                            dynamicDesiredRetentionMin,
+                            dynamicDesiredRetentionMax,
+                            search: evaluateSearch,
+                            ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
+                            includeSameDayReviews: comparisonIncludeSameDayReviews,
+                            current: {
+                                logLoss: currentMetrics.logLoss,
+                                rmseBins: currentMetrics.rmseBins,
+                            },
+                            optimized: {
+                                logLoss: optimizedMetrics.logLoss,
+                                rmseBins: optimizedMetrics.rmseBins,
+                            },
+                        };
                     }
                     if (computeParamsProgress) {
                         computeParamsProgress.current = computeParamsProgress.total;
@@ -275,9 +902,291 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                     }
                 },
             );
+        } catch (err) {
+            if (!isInterrupted(err)) {
+                alert(optimizationFailureFeedback(err, params));
+            }
         } finally {
             computingParams = false;
         }
+    }
+
+    function closeOptimizationComparison(): void {
+        optimizationComparison = undefined;
+        customDecayRows = [];
+        loadingCustomDecayTable = false;
+    }
+
+    function keepCurrentParams(): void {
+        closeOptimizationComparison();
+    }
+
+    function applyOptimizedParams(): void {
+        if (!optimizationComparison) {
+            return;
+        }
+        setSelectedFsrsParams(optimizationComparison.optimizedParams);
+        if (optimizationComparison.dynamicDesiredRetentionParams.length) {
+            $config.fsrsDynamicDesiredRetentionParams =
+                optimizationComparison.dynamicDesiredRetentionParams;
+            $config.fsrsDynamicDesiredRetentionWeights =
+                optimizationComparison.dynamicDesiredRetentionWeights;
+            $config.fsrsDynamicDesiredRetentionAvgDrs =
+                optimizationComparison.dynamicDesiredRetentionAvgDrs;
+            $config.fsrsDynamicDesiredRetentionFsrsEqWeights =
+                optimizationComparison.dynamicDesiredRetentionFsrsEqWeights;
+            $config.fsrsDynamicDesiredRetentionFsrsEqDrs =
+                optimizationComparison.dynamicDesiredRetentionFsrsEqDrs;
+            $config.fsrsDynamicDesiredRetentionFixedTargetWeights =
+                optimizationComparison.dynamicDesiredRetentionFixedTargetWeights;
+            $config.fsrsDynamicDesiredRetentionFixedTargetDrs =
+                optimizationComparison.dynamicDesiredRetentionFixedTargetDrs;
+            $config.fsrsDynamicDesiredRetentionMin =
+                optimizationComparison.dynamicDesiredRetentionMin;
+            $config.fsrsDynamicDesiredRetentionMax =
+                optimizationComparison.dynamicDesiredRetentionMax;
+        }
+        optimized = true;
+        closeOptimizationComparison();
+    }
+
+    async function loadCustomDecayTable(): Promise<void> {
+        if (
+            !optimizationComparison ||
+            loadingCustomDecayTable ||
+            !supportsCustomDecayTable(optimizationComparison.optimizedParams)
+        ) {
+            return;
+        }
+        loadingCustomDecayTable = true;
+        try {
+            const comparison = optimizationComparison;
+            const rows = await Promise.all(
+                customDecayCandidates.map(async (decay) => {
+                    const resp = await evaluateParamsLegacy({
+                        search: comparison.search,
+                        ignoreRevlogsBeforeMs: comparison.ignoreRevlogsBeforeMs,
+                        params: withLastParam(comparison.optimizedParams, decay),
+                        includeSameDayReviews: comparison.includeSameDayReviews,
+                    });
+                    return {
+                        decay,
+                        isBaseline: false,
+                        logLoss: resp.logLoss,
+                        rmseBins: resp.rmseBins,
+                        logLossDelta: metricDelta(
+                            comparison.optimized.logLoss,
+                            resp.logLoss,
+                        ),
+                        logLossDeltaPercent: metricDeltaPercent(
+                            comparison.optimized.logLoss,
+                            resp.logLoss,
+                        ),
+                        rmseDelta: metricDelta(
+                            comparison.optimized.rmseBins,
+                            resp.rmseBins,
+                        ),
+                        rmseDeltaPercent: metricDeltaPercent(
+                            comparison.optimized.rmseBins,
+                            resp.rmseBins,
+                        ),
+                    };
+                }),
+            );
+            const optimizedDecay =
+                comparison.optimizedParams[comparison.optimizedParams.length - 1] ?? 0;
+            customDecayRows = [
+                {
+                    decay: optimizedDecay,
+                    isBaseline: true,
+                    logLoss: optimizationComparison.optimized.logLoss,
+                    rmseBins: optimizationComparison.optimized.rmseBins,
+                    logLossDelta: 0,
+                    logLossDeltaPercent: 0,
+                    rmseDelta: 0,
+                    rmseDeltaPercent: 0,
+                },
+                ...rows,
+            ];
+        } finally {
+            loadingCustomDecayTable = false;
+        }
+    }
+
+    async function sameDayParamsCandidate(
+        label: string,
+        includeSameDayReviews: boolean,
+        currentParams: number[],
+    ): Promise<SameDayParamsCandidate> {
+        const paramsResp = await computeFsrsParams(
+            {
+                search: optimizeSearchFilter(),
+                ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
+                currentParams,
+                numOfRelearningSteps: getNumOfRelearningStepsInDay(),
+                healthCheck: false,
+                includeSameDayReviews,
+                enableSchedulingPenalties: enableSchedulingPenaltiesOverride(),
+                fsrsVersion: DeckConfig_Config_FsrsVersion.SEVEN,
+                dynamicDesiredRetentionEnabled: false,
+            },
+            { alertOnError: false },
+        );
+        return {
+            label,
+            fsrsItems: paramsResp.fsrsItems,
+            params: paramsResp.params,
+        };
+    }
+
+    async function sameDayDecisionRow(
+        candidate: SameDayParamsCandidate,
+    ): Promise<SameDayDecisionRow> {
+        const search = evaluateSearchFilter();
+        const allTargets = await evaluateParamsLegacy(
+            {
+                search,
+                ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
+                params: candidate.params,
+                includeSameDayReviews: true,
+            },
+            { alertOnError: false },
+        );
+        const longTermTargets = await evaluateParamsLegacy(
+            {
+                search,
+                ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
+                params: candidate.params,
+                includeSameDayReviews: false,
+            },
+            { alertOnError: false },
+        );
+        return {
+            label: candidate.label,
+            fsrsItems: candidate.fsrsItems,
+            allTargets: {
+                logLoss: allTargets.logLoss,
+                rmseBins: allTargets.rmseBins,
+            },
+            longTermTargets: {
+                logLoss: longTermTargets.logLoss,
+                rmseBins: longTermTargets.rmseBins,
+            },
+        };
+    }
+
+    async function checkSameDayDecision(): Promise<void> {
+        if (checkingSameDayDecision) {
+            await setWantsAbort({});
+            return;
+        }
+        if (state.presetAssignmentsChanged()) {
+            alert(tr.deckConfigPleaseSaveYourChangesFirst());
+            return;
+        }
+        const currentParams = selectedFsrsParams($config);
+        try {
+            requireValidFsrsParams("current", currentParams);
+        } catch (err) {
+            if (!isInterrupted(err)) {
+                alert(optimizationFailureFeedback(err, currentParams));
+            }
+            return;
+        }
+        await commitEditing();
+        checkingSameDayDecision = true;
+        computeParamsProgress = undefined;
+        sameDayDecisionComparison = undefined;
+        try {
+            await runWithBackendProgress(
+                async () => {
+                    const withSameDayParams = await sameDayParamsCandidate(
+                        "Optimized with same-day reviews",
+                        true,
+                        currentParams,
+                    );
+                    const withoutSameDayParams = await sameDayParamsCandidate(
+                        "Optimized without same-day reviews",
+                        false,
+                        currentParams,
+                    );
+                    if (
+                        !withSameDayParams.fsrsItems ||
+                        !withoutSameDayParams.fsrsItems
+                    ) {
+                        alert(
+                            "Not enough review history to compare same-day settings.",
+                        );
+                        return;
+                    }
+                    const withSameDay = await sameDayDecisionRow(withSameDayParams);
+                    const withoutSameDay =
+                        await sameDayDecisionRow(withoutSameDayParams);
+                    sameDayDecisionComparison = { withSameDay, withoutSameDay };
+                    if (computeParamsProgress) {
+                        computeParamsProgress.current = computeParamsProgress.total;
+                    }
+                },
+                (progress) => {
+                    if (progress.value.case === "computeParams") {
+                        computeParamsProgress = progress.value.value;
+                    }
+                },
+            );
+        } catch (err) {
+            if (!isInterrupted(err)) {
+                alert(optimizationFailureFeedback(err, currentParams));
+            }
+        } finally {
+            checkingSameDayDecision = false;
+        }
+    }
+
+    function sameDayMetricClass(value: number, otherValue: number): string {
+        return `optimize-delta ${deltaClass(metricDelta(otherValue, value))}`;
+    }
+
+    function sameDayRecommendation(
+        comparison: SameDayDecisionComparison,
+    ): SameDayRecommendation {
+        const allLogLossDelta = metricDelta(
+            comparison.withoutSameDay.allTargets.logLoss,
+            comparison.withSameDay.allTargets.logLoss,
+        );
+        const longTermLogLossDelta = metricDelta(
+            comparison.withoutSameDay.longTermTargets.logLoss,
+            comparison.withSameDay.longTermTargets.logLoss,
+        );
+        const allLogLossDeltaText = formatDelta(allLogLossDelta);
+        const longTermLogLossDeltaText = formatDelta(longTermLogLossDelta);
+
+        if (allLogLossDelta === 0 && longTermLogLossDelta === 0) {
+            return {
+                tone: "equal",
+                text: "No clear winner: both options have the same log loss on all targets and long-term-only targets.",
+            };
+        }
+
+        if (
+            longTermLogLossDelta <= 0 ||
+            (allLogLossDelta < 0 && Math.abs(allLogLossDelta) >= longTermLogLossDelta)
+        ) {
+            return {
+                tone: "better",
+                text:
+                    `Recommended: include same-day reviews. ` +
+                    `All-target log loss changes by ${allLogLossDeltaText}, ` +
+                    `and long-term-only log loss changes by ${longTermLogLossDeltaText}.`,
+            };
+        }
+
+        return {
+            tone: "worse",
+            text:
+                `Recommended: exclude same-day reviews. ` +
+                `All-target log loss changes by ${allLogLossDeltaText}, ` +
+                `but long-term-only log loss changes by ${longTermLogLossDeltaText}.`,
+        };
     }
 
     async function checkParams(): Promise<void> {
@@ -289,19 +1198,24 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
             alert(tr.deckConfigPleaseSaveYourChangesFirst());
             return;
         }
+        const params = fsrsParamsForEvaluation($config, defaults);
         checkingParams = true;
         computeParamsProgress = undefined;
         try {
+            requireValidFsrsParams("current", params);
             await runWithBackendProgress(
                 async () => {
-                    const search = $config.paramSearch
-                        ? $config.paramSearch
-                        : defaultparamSearch;
-                    const resp = await evaluateParamsLegacy({
-                        search,
-                        ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
-                        params: fsrsParams($config),
-                    });
+                    const search = evaluateSearchFilter();
+                    const resp = await evaluateParamsLegacy(
+                        {
+                            search,
+                            ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
+                            params,
+                            includeSameDayReviews:
+                                includeSameDayOverrideForParams(params),
+                        },
+                        { alertOnError: false },
+                    );
                     if (computeParamsProgress) {
                         computeParamsProgress.current = computeParamsProgress.total;
                     }
@@ -321,21 +1235,100 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
                     }
                 },
             );
+        } catch (err) {
+            if (!isInterrupted(err)) {
+                alert(optimizationFailureFeedback(err, params));
+            }
         } finally {
             checkingParams = false;
         }
     }
 
+    async function checkHealth(): Promise<void> {
+        if (checkingHealth) {
+            await setWantsAbort({});
+            return;
+        }
+        if (state.presetAssignmentsChanged()) {
+            alert(tr.deckConfigPleaseSaveYourChangesFirst());
+            return;
+        }
+        const params = selectedFsrsParams($config);
+        checkingHealth = true;
+        computeParamsProgress = undefined;
+        try {
+            requireValidFsrsParams("current", params);
+            await runWithBackendProgress(
+                async () => {
+                    const search = evaluateSearchFilter();
+                    const searchForTraining = optimizeSearchFilter();
+                    const resp = await evaluateParams(
+                        {
+                            search,
+                            searchForTraining,
+                            ignoreRevlogsBeforeMs: getIgnoreRevlogsBeforeMs(),
+                            numOfRelearningSteps: getNumOfRelearningStepsInDay(),
+                            fsrsVersion: $config.fsrsVersion,
+                            includeSameDayReviews: includeSameDayOverride(),
+                            includeSameDayReviewsForTraining: includeSameDayOverride(),
+                            enableSchedulingPenalties:
+                                enableSchedulingPenaltiesOverride(),
+                        },
+                        { alertOnError: false },
+                    );
+                    if (computeParamsProgress) {
+                        computeParamsProgress.current = computeParamsProgress.total;
+                    }
+                    setTimeout(
+                        () =>
+                            alert(
+                                `Log loss: ${resp.logLoss.toFixed(4)}, RMSE(bins): ${(
+                                    resp.rmseBins * 100
+                                ).toFixed(2)}%. ${tr.deckConfigSmallerIsBetter()}`,
+                            ),
+                        200,
+                    );
+                },
+                (progress) => {
+                    if (progress.value.case === "computeParams") {
+                        computeParamsProgress = progress.value.value;
+                    }
+                },
+            );
+        } catch (err) {
+            if (!isInterrupted(err)) {
+                alert(optimizationFailureFeedback(err, params));
+            }
+        } finally {
+            checkingHealth = false;
+        }
+    }
+
     $: computeParamsProgressString = renderWeightProgress(computeParamsProgress);
+    $: computeParamsProgressPct = renderComputeParamsProgressPct(computeParamsProgress);
     $: totalReviews = computeParamsProgress?.reviews ?? undefined;
 
-    function renderWeightProgress(val: ComputeParamsProgress | undefined): String {
+    function renderComputeParamsProgressPct(
+        val: ComputeParamsProgress | undefined,
+    ): number | undefined {
         if (!val || !val.total) {
+            return undefined;
+        }
+        return Math.min(100, Math.max(0, (val.current / val.total) * 100));
+    }
+
+    function renderWeightProgress(val: ComputeParamsProgress | undefined): String {
+        const pctValue = renderComputeParamsProgressPct(val);
+        if (!val || pctValue === undefined) {
             return "";
         }
-        const pct = ((val.current / val.total) * 100).toFixed(1);
+        const pct = pctValue.toFixed(1);
         if (val instanceof ComputeRetentionProgress) {
             return `${pct}%`;
+        } else if (
+            val.phase === ComputeParamsProgress_Phase.TRAINING_DYNAMIC_DESIRED_RETENTION
+        ) {
+            return `Compute ADR values: ${pct}%`;
         } else {
             if (val.current === val.total) {
                 return tr.deckConfigCheckingForImprovement();
@@ -347,15 +1340,42 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
     async function computeAllParams(): Promise<void> {
         await commitEditing();
-
-        if (confirm(tr.deckConfigFsrsConfirmSaveAndOptimize())) {
-            state.save(UpdateDeckConfigsMode.COMPUTE_ALL_PARAMS);
-            window.location.reload();
+        const incompatiblePresetNames = state.incompatibleFsrsParamPresetNames();
+        if (incompatiblePresetNames.length) {
+            const shownPresets = incompatiblePresetNames
+                .slice(0, 8)
+                .map((name) => `- ${name}`)
+                .join("\n");
+            const remaining = incompatiblePresetNames.length - 8;
+            const remainingText = remaining > 0 ? `\n- ...and ${remaining} more` : "";
+            const shouldClear = confirm(
+                [
+                    "Some presets have incompatible FSRS parameters. Optimize All Presets needs to clear those fields first so the default parameters can be used.",
+                    `Affected presets:\n${shownPresets}${remainingText}`,
+                    "Clear the incompatible FSRS parameters and continue?",
+                ].join("\n\n"),
+            );
+            if (!shouldClear) {
+                return;
+            }
+            state.clearIncompatibleFsrsParams();
         }
+        state.save(UpdateDeckConfigsMode.COMPUTE_ALL_PARAMS);
     }
 
     function showSimulatorModal(modal: Modal) {
-        if (fsrsParams($config).toString() === initialParams.toString()) {
+        const params = selectedFsrsParams($config);
+        const diagnostics = fsrsParamDiagnostics(params);
+        if (!diagnostics.valid) {
+            logFsrsParamProblem(
+                "validation failed before simulator",
+                "current",
+                params,
+            );
+            alert(fsrsParamDiagnosticDetails(diagnostics));
+            return;
+        }
+        if (params.toString() === initialParams.toString()) {
             modal?.show();
         } else {
             alert(tr.deckConfigFsrsSimulateSavePreset());
@@ -364,6 +1384,96 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
     let simulatorModal: Modal;
     let workloadModal: Modal;
+    let dynamicDesiredRetentionPlotModal: Modal;
+    const dynamicDesiredRetentionCalibrationCounts = Array.from(
+        { length: 31 },
+        (_, index) => index + 2,
+    );
+    dynamicDesiredRetentionCalibrationCounts.unshift(0);
+    $: dynamicDesiredRetentionTargetCalibration = targetDrCalibration(
+        $config.fsrsDynamicDesiredRetentionWeights,
+        $config.fsrsDynamicDesiredRetentionAvgDrs,
+        $config.fsrsDynamicDesiredRetentionFsrsEqWeights,
+        $config.fsrsDynamicDesiredRetentionFsrsEqDrs,
+        $config.fsrsDynamicDesiredRetentionFixedTargetWeights,
+        $config.fsrsDynamicDesiredRetentionFixedTargetDrs,
+    );
+    $: dynamicDesiredRetentionSchedulingTarget = schedulingTargetDr(
+        effectiveDesiredRetention,
+        dynamicDesiredRetentionTargetCalibration.weights,
+        dynamicDesiredRetentionTargetCalibration.drs,
+        $config.fsrsDynamicDesiredRetentionClamp,
+        dynamicDesiredRetentionTargetCalibration.fixedTarget,
+        $config.fsrsDynamicDesiredRetentionMin,
+    );
+    $: dynamicDesiredRetentionWeight = costWeightForAverageDr(
+        dynamicDesiredRetentionSchedulingTarget,
+        dynamicDesiredRetentionTargetCalibration.weights,
+        dynamicDesiredRetentionTargetCalibration.drs,
+        dynamicDesiredRetentionTargetCalibration.fixedTarget,
+        $config.fsrsDynamicDesiredRetentionMin,
+    );
+    $: dynamicDesiredRetentionConfigReady = dynamicDesiredRetentionEnabled($config);
+    $: dynamicDesiredRetentionReady =
+        dynamicDesiredRetentionConfigReady && dynamicDesiredRetentionWeight !== null;
+    $: dynamicDesiredRetentionWarning = dynamicDesiredRetentionWarningMessage(
+        $config,
+        dynamicDesiredRetentionConfigReady,
+        dynamicDesiredRetentionWeight,
+    );
+    $: outdatedFsrs7ParamsWarning =
+        $config.fsrsVersion === DeckConfig_Config_FsrsVersion.SEVEN &&
+        fsrsParamDiagnostics($config.fsrsParams7).outdatedFsrs7PreviewParams
+            ? OUTDATED_FSRS7_PREVIEW_PARAMS_WARNING
+            : "";
+
+    function dynamicDesiredRetentionWarningMessage(
+        config: DeckConfig_Config,
+        configReady: boolean,
+        weight: number | null,
+    ): string {
+        if (!config.fsrsDynamicDesiredRetentionEnabled) {
+            return "";
+        }
+        if (
+            !validPolicyParams(config.fsrsDynamicDesiredRetentionParams) ||
+            !validCalibration(
+                config.fsrsDynamicDesiredRetentionWeights,
+                config.fsrsDynamicDesiredRetentionAvgDrs,
+            ) ||
+            !validOptionalFixedTargetCalibration(
+                config.fsrsDynamicDesiredRetentionFixedTargetWeights,
+                config.fsrsDynamicDesiredRetentionFixedTargetDrs,
+            )
+        ) {
+            return "Dynamic DR requires 15 ADR policy parameters and matching calibration arrays.";
+        }
+        if (
+            !validRetentionBounds(
+                config.fsrsDynamicDesiredRetentionMin,
+                config.fsrsDynamicDesiredRetentionMax,
+            )
+        ) {
+            return "Dynamic DR requires valid retention bounds.";
+        }
+        if (configReady && weight === null) {
+            return "Dynamic DR target is outside the calibrated target range.";
+        }
+        return "";
+    }
+
+    function formatDynamicDrBound(value: number): string {
+        return Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : "n/a";
+    }
+
+    function saveDynamicDesiredRetentionPlotTarget(event: CustomEvent<number>): void {
+        effectiveDesiredRetention = event.detail;
+        if ($limits.desiredRetention !== undefined) {
+            desiredRetentionTabs[1].setValue(event.detail);
+        } else {
+            desiredRetentionTabs[0].setValue(event.detail);
+        }
+    }
 </script>
 
 <DynamicallySlottable slotHost={Item} api={{}}>
@@ -371,7 +1481,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         <SpinBoxFloatRow
             bind:value={effectiveDesiredRetention}
             defaultValue={defaults.desiredRetention}
-            min={0.7}
+            min={0.1}
             max={0.99}
             percentage={true}
             bind:focused={desiredRetentionFocused}
@@ -387,31 +1497,232 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         </SpinBoxFloatRow>
     </Item>
 </DynamicallySlottable>
-
-<button
-    class="btn btn-primary"
-    on:click={() => {
-        simulateFsrsRequest.reviewLimit = 9999;
-        showSimulatorModal(workloadModal);
-    }}
->
-    {tr.deckConfigFsrsDesiredRetentionHelpMeDecideExperimental()}
-</button>
-
-<Warning warning={desiredRetentionChangeInfo} className={"alert-info two-line"} />
+<Warning warning={desiredRetentionChangeInfo} className={desiredRetentionChangeClass} />
 <Warning warning={desiredRetentionWarning} className={retentionWarningClass} />
 
-<div class="ms-1 me-1">
-    <ParamsInputRow bind:value={$config.fsrsParams6} defaultValue={[]}>
-        <SettingTitle on:click={() => openHelpModal("modelParams")}>
-            {tr.deckConfigWeights()}
-        </SettingTitle>
-    </ParamsInputRow>
+{#if newCardIntervals}
+    <div class="interval-preview ms-1 me-1">
+        <div class="interval-preview-title">
+            {tr.deckConfigNewCardIntervals()}
+        </div>
+        <table class="interval-preview-table">
+            <thead>
+                <tr>
+                    <th></th>
+                    <th>
+                        {tr.deckConfigCurrentDr()}
+                        ({(startingDesiredRetentionValue * 100).toFixed(2)}%)
+                    </th>
+                    <th>
+                        {tr.deckConfigSelectedDr()}
+                        ({(effectiveDesiredRetention * 100).toFixed(2)}%)
+                    </th>
+                </tr>
+            </thead>
+            <tbody>
+                {#each intervalColumns as column, index}
+                    <tr class={intervalRowClasses[index]}>
+                        <th>{column}</th>
+                        <td>{newCardIntervals[0][index]}</td>
+                        <td>{newCardIntervals[1][index]}</td>
+                    </tr>
+                {/each}
+            </tbody>
+        </table>
+    </div>
+{/if}
 
+<Warning warning={newCardIntervalsError} className={"alert-warning"} />
+<Warning warning={outdatedFsrs7ParamsWarning} className="alert-warning" />
+
+<div class="ms-1 me-1">
+    <button
+        class="btn {computingParams ? 'btn-warning' : 'btn-primary'}"
+        disabled={!computingParams && computing}
+        on:click={() => computeParams()}
+    >
+        {#if computingParams}
+            {tr.actionsCancel()}
+        {:else}
+            {tr.deckConfigOptimizeButton()}
+        {/if}
+    </button>
+    <button class="btn btn-primary" on:click={() => computeAllParams()}>
+        {tr.deckConfigSaveAndOptimize()}
+    </button>
+    <div>
+        {#if computingParams || checkingParams || checkingHealth || checkingSameDayDecision}
+            {computeParamsProgressString}
+            {#if computeParamsProgressPct !== undefined}
+                <div
+                    class="progress fsrs-progress"
+                    role="progressbar"
+                    aria-valuenow={computeParamsProgressPct}
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                >
+                    <div
+                        class="progress-bar"
+                        style={`width: ${computeParamsProgressPct}%`}
+                    ></div>
+                </div>
+            {/if}
+        {:else if totalReviews !== undefined}
+            {tr.statisticsReviews({ reviews: totalReviews })}
+        {/if}
+    </div>
+</div>
+
+<details class="fsrs-advanced m-1">
+    <summary>{tr.deckConfigAdvancedSettings()}</summary>
+
+    <div>
+        <button
+            class="btn btn-outline-primary"
+            on:click={() => {
+                simulateFsrsRequest.reviewLimit = 9999;
+                showSimulatorModal(workloadModal);
+            }}
+        >
+            {tr.deckConfigFsrsDesiredRetentionHelpMeDecideExperimental()}
+        </button>
+    </div>
+
+    <Warning warning={lastOptimizationWarning} className="alert-warning" />
+
+    {#if $config.fsrsVersion === DeckConfig_Config_FsrsVersion.SEVEN}
+        <SwitchRow bind:value={includeSameDayReviewsInFsrs7} defaultValue={true}>
+            <SettingTitle>Include same-day reviews in FSRS-7</SettingTitle>
+        </SwitchRow>
+        <SwitchRow bind:value={enableSchedulingPenaltiesInFsrs7} defaultValue={false}>
+            <SettingTitle>Use scheduling penalties in FSRS-7 optimization</SettingTitle>
+        </SwitchRow>
+        <button
+            class="btn {checkingSameDayDecision
+                ? 'btn-warning'
+                : 'btn-outline-primary'}"
+            disabled={!checkingSameDayDecision && computing}
+            on:click={() => checkSameDayDecision()}
+        >
+            {#if checkingSameDayDecision}
+                {tr.actionsCancel()}
+            {:else}
+                Same-day reviews: Help Me Decide
+            {/if}
+        </button>
+    {/if}
+
+    <div class="mb-3">
+        <SettingTitle>{tr.deckConfigFsrsVersion()}</SettingTitle>
+        <select bind:value={$config.fsrsVersion} class="form-select">
+            {#each fsrsVersionChoices as choice}
+                <option value={choice.value}>{choice.label}</option>
+            {/each}
+        </select>
+    </div>
+
+    {#if $config.fsrsVersion === DeckConfig_Config_FsrsVersion.SIX}
+        <ParamsInputRow bind:value={$config.fsrsParams6} defaultValue={[]}>
+            <SettingTitle on:click={() => openHelpModal("modelParams")}>
+                {tr.deckConfigWeights()}
+            </SettingTitle>
+        </ParamsInputRow>
+    {:else if $config.fsrsVersion === DeckConfig_Config_FsrsVersion.FIVE}
+        <ParamsInputRow bind:value={$config.fsrsParams5} defaultValue={[]}>
+            <SettingTitle on:click={() => openHelpModal("modelParams")}>
+                {tr.deckConfigWeights()}
+            </SettingTitle>
+        </ParamsInputRow>
+    {:else if $config.fsrsVersion === DeckConfig_Config_FsrsVersion.FOUR}
+        <ParamsInputRow bind:value={$config.fsrsParams4} defaultValue={[]}>
+            <SettingTitle on:click={() => openHelpModal("modelParams")}>
+                {tr.deckConfigWeights()}
+            </SettingTitle>
+        </ParamsInputRow>
+    {:else}
+        <ParamsInputRow bind:value={$config.fsrsParams7} defaultValue={[]}>
+            <SettingTitle on:click={() => openHelpModal("modelParams")}>
+                {tr.deckConfigWeights()}
+            </SettingTitle>
+        </ParamsInputRow>
+    {/if}
+
+    {#if $config.fsrsVersion === DeckConfig_Config_FsrsVersion.SEVEN}
+        <SwitchRow
+            bind:value={$config.fsrsDynamicDesiredRetentionEnabled}
+            defaultValue={false}
+        >
+            <SettingTitle>Dynamic DR (ADR)</SettingTitle>
+        </SwitchRow>
+
+        {#if $config.fsrsDynamicDesiredRetentionEnabled}
+            <SwitchRow
+                bind:value={$config.fsrsDynamicDesiredRetentionClamp}
+                defaultValue={false}
+            >
+                <SettingTitle>Clamp Unsupported Dynamic DR Targets</SettingTitle>
+            </SwitchRow>
+            <ParamsInputRow
+                bind:value={$config.fsrsDynamicDesiredRetentionParams}
+                defaultValue={[]}
+                validParamCounts={[0, 15]}
+                ariaLabel="Dynamic DR ADR policy parameters"
+            >
+                <SettingTitle>ADR Policy Parameters</SettingTitle>
+            </ParamsInputRow>
+            <ParamsInputRow
+                bind:value={$config.fsrsDynamicDesiredRetentionWeights}
+                defaultValue={[]}
+                validParamCounts={dynamicDesiredRetentionCalibrationCounts}
+                ariaLabel="Dynamic DR calibration weights"
+            >
+                <SettingTitle>Calibration Weights</SettingTitle>
+            </ParamsInputRow>
+            <ParamsInputRow
+                bind:value={$config.fsrsDynamicDesiredRetentionAvgDrs}
+                defaultValue={[]}
+                validParamCounts={dynamicDesiredRetentionCalibrationCounts}
+                ariaLabel="Dynamic DR calibration average desired retentions"
+            >
+                <SettingTitle>Calibration Avg ADR DRs</SettingTitle>
+            </ParamsInputRow>
+            <div class="dynamic-dr-actions">
+                <span>
+                    Weight:
+                    {dynamicDesiredRetentionWeight === null
+                        ? "n/a"
+                        : dynamicDesiredRetentionWeight.toFixed(2)}
+                </span>
+                <span>
+                    Bounds:
+                    {formatDynamicDrBound($config.fsrsDynamicDesiredRetentionMin)}
+                    -
+                    {formatDynamicDrBound($config.fsrsDynamicDesiredRetentionMax)}
+                </span>
+                <button
+                    class="btn btn-outline-primary"
+                    disabled={!dynamicDesiredRetentionReady}
+                    on:click={() => dynamicDesiredRetentionPlotModal?.show()}
+                >
+                    Visualize DR plot
+                </button>
+            </div>
+            <Warning
+                warning={dynamicDesiredRetentionWarning}
+                className="alert-warning"
+            />
+        {/if}
+    {/if}
+
+    <ParamsSearchRow bind:value={$config.paramSearch} placeholder={defaultparamSearch}>
+        <SettingTitle>Optimize Search Filter</SettingTitle>
+    </ParamsSearchRow>
     <ParamsSearchRow
-        bind:value={$config.paramSearch}
+        bind:value={evaluationSearchFilter}
         placeholder={defaultparamSearch}
-    />
+    >
+        <SettingTitle>Evaluation Search Filter</SettingTitle>
+    </ParamsSearchRow>
 
     <SwitchRow bind:value={$fsrsReschedule} defaultValue={false}>
         <SettingTitle on:click={() => openHelpModal("rescheduleCardsOnChange")}>
@@ -432,14 +1743,14 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     </SwitchRow>
 
     <button
-        class="btn {computingParams ? 'btn-warning' : 'btn-primary'}"
-        disabled={!computingParams && computing}
-        on:click={() => computeParams()}
+        class="btn {checkingHealth ? 'btn-warning' : 'btn-primary'}"
+        disabled={!checkingHealth && computing}
+        on:click={() => checkHealth()}
     >
-        {#if computingParams}
+        {#if checkingHealth}
             {tr.actionsCancel()}
         {:else}
-            {tr.deckConfigOptimizeButton()}
+            {tr.deckConfigHealthCheckButton()}
         {/if}
     </button>
     {#if state.legacyEvaluate}
@@ -455,30 +1766,10 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
             {/if}
         </button>
     {/if}
-    <div>
-        {#if computingParams || checkingParams}
-            {computeParamsProgressString}
-        {:else if totalReviews !== undefined}
-            {tr.statisticsReviews({ reviews: totalReviews })}
-        {/if}
-    </div>
-</div>
-
-<div class="m-1">
-    <Warning warning={lastOptimizationWarning} className="alert-warning" />
-
-    <button class="btn btn-primary" on:click={() => computeAllParams()}>
-        {tr.deckConfigSaveAndOptimize()}
-    </button>
-</div>
-
-<hr />
-
-<div class="m-1">
     <button class="btn btn-primary" on:click={() => showSimulatorModal(simulatorModal)}>
         {tr.deckConfigFsrsSimulatorExperimental()}
     </button>
-</div>
+</details>
 
 <SimulatorModal
     bind:modal={simulatorModal}
@@ -499,9 +1790,294 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     {onPresetChange}
 />
 
+<DynamicDesiredRetentionPlotModal
+    bind:modal={dynamicDesiredRetentionPlotModal}
+    params={$config.fsrsDynamicDesiredRetentionParams}
+    calibrationWeights={$config.fsrsDynamicDesiredRetentionWeights}
+    calibrationAvgDrs={$config.fsrsDynamicDesiredRetentionAvgDrs}
+    fsrsEquivalentWeights={$config.fsrsDynamicDesiredRetentionFsrsEqWeights}
+    fsrsEquivalentDrs={$config.fsrsDynamicDesiredRetentionFsrsEqDrs}
+    fixedTargetWeights={$config.fsrsDynamicDesiredRetentionFixedTargetWeights}
+    fixedTargetDrs={$config.fsrsDynamicDesiredRetentionFixedTargetDrs}
+    retentionMin={$config.fsrsDynamicDesiredRetentionMin}
+    retentionMax={$config.fsrsDynamicDesiredRetentionMax}
+    targetAverageDr={effectiveDesiredRetention}
+    on:saveTarget={saveDynamicDesiredRetentionPlotTarget}
+/>
+
+{#if sameDayDecisionComparison}
+    {@const recommendation = sameDayRecommendation(sameDayDecisionComparison)}
+    <div class="optimization-popup-backdrop">
+        <div class="optimization-popup optimization-popup-wide">
+            <div class="optimization-popup-header">Same-Day Review Comparison</div>
+            <table class="optimization-popup-table same-day-comparison-table">
+                <thead>
+                    <tr>
+                        <th>Candidate</th>
+                        <th>Training targets</th>
+                        <th>All log loss</th>
+                        <th>All RMSE</th>
+                        <th>Long-term log loss</th>
+                        <th>Long-term RMSE</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {#each [sameDayDecisionComparison.withSameDay, sameDayDecisionComparison.withoutSameDay] as row}
+                        <tr>
+                            <th>{row.label}</th>
+                            <td>{row.fsrsItems}</td>
+                            <td
+                                class={sameDayMetricClass(
+                                    row.allTargets.logLoss,
+                                    row === sameDayDecisionComparison.withSameDay
+                                        ? sameDayDecisionComparison.withoutSameDay
+                                              .allTargets.logLoss
+                                        : sameDayDecisionComparison.withSameDay
+                                              .allTargets.logLoss,
+                                )}
+                            >
+                                {formatMetric(row.allTargets.logLoss)}
+                            </td>
+                            <td
+                                class={sameDayMetricClass(
+                                    row.allTargets.rmseBins,
+                                    row === sameDayDecisionComparison.withSameDay
+                                        ? sameDayDecisionComparison.withoutSameDay
+                                              .allTargets.rmseBins
+                                        : sameDayDecisionComparison.withSameDay
+                                              .allTargets.rmseBins,
+                                )}
+                            >
+                                {formatMetric(row.allTargets.rmseBins)}
+                            </td>
+                            <td
+                                class={sameDayMetricClass(
+                                    row.longTermTargets.logLoss,
+                                    row === sameDayDecisionComparison.withSameDay
+                                        ? sameDayDecisionComparison.withoutSameDay
+                                              .longTermTargets.logLoss
+                                        : sameDayDecisionComparison.withSameDay
+                                              .longTermTargets.logLoss,
+                                )}
+                            >
+                                {formatMetric(row.longTermTargets.logLoss)}
+                            </td>
+                            <td
+                                class={sameDayMetricClass(
+                                    row.longTermTargets.rmseBins,
+                                    row === sameDayDecisionComparison.withSameDay
+                                        ? sameDayDecisionComparison.withoutSameDay
+                                              .longTermTargets.rmseBins
+                                        : sameDayDecisionComparison.withSameDay
+                                              .longTermTargets.rmseBins,
+                                )}
+                            >
+                                {formatMetric(row.longTermTargets.rmseBins)}
+                            </td>
+                        </tr>
+                    {/each}
+                </tbody>
+            </table>
+            <div class={`same-day-recommendation ${recommendation.tone}`}>
+                {recommendation.text}
+            </div>
+            <div class="optimization-popup-footer">
+                <button
+                    class="btn btn-secondary"
+                    on:click={() => (sameDayDecisionComparison = undefined)}
+                >
+                    Close
+                </button>
+            </div>
+        </div>
+    </div>
+{/if}
+
+{#if optimizationComparison}
+    {@const logLossDelta = metricDelta(
+        optimizationComparison.current.logLoss,
+        optimizationComparison.optimized.logLoss,
+    )}
+    {@const rmseDelta = metricDelta(
+        optimizationComparison.current.rmseBins,
+        optimizationComparison.optimized.rmseBins,
+    )}
+    {@const logLossDeltaPercent = metricDeltaPercent(
+        optimizationComparison.current.logLoss,
+        optimizationComparison.optimized.logLoss,
+    )}
+    {@const rmseDeltaPercent = metricDeltaPercent(
+        optimizationComparison.current.rmseBins,
+        optimizationComparison.optimized.rmseBins,
+    )}
+    <div class="optimization-popup-backdrop">
+        <div class="optimization-popup">
+            <div class="optimization-popup-header">Optimization Result</div>
+            <table class="optimization-popup-table">
+                <thead>
+                    <tr>
+                        <th>Metric</th>
+                        <th>Current</th>
+                        <th>Optimized</th>
+                        <th>Delta</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <th>Log loss</th>
+                        <td>{formatMetric(optimizationComparison.current.logLoss)}</td>
+                        <td>
+                            {formatMetric(optimizationComparison.optimized.logLoss)}
+                        </td>
+                        <td class={`optimize-delta ${deltaClass(logLossDelta)}`}>
+                            {formatDelta(logLossDelta)}
+                            ({formatPercentDelta(logLossDeltaPercent)})
+                        </td>
+                    </tr>
+                    <tr>
+                        <th>RMSE (bins)</th>
+                        <td>{formatMetric(optimizationComparison.current.rmseBins)}</td>
+                        <td>
+                            {formatMetric(optimizationComparison.optimized.rmseBins)}
+                        </td>
+                        <td class={`optimize-delta ${deltaClass(rmseDelta)}`}>
+                            {formatDelta(rmseDelta)}
+                            ({formatPercentDelta(rmseDeltaPercent)})
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="optimization-popup-actions">
+                <button
+                    class="btn btn-outline-primary"
+                    disabled={loadingCustomDecayTable ||
+                        !supportsCustomDecayTable(
+                            optimizationComparison.optimizedParams,
+                        )}
+                    on:click={loadCustomDecayTable}
+                >
+                    {#if !supportsCustomDecayTable(optimizationComparison.optimizedParams)}
+                        Custom Decay Table (FSRS-7 unsupported)
+                    {:else if loadingCustomDecayTable}
+                        {tr.actionsProcessing()}
+                    {:else}
+                        Load Custom Decay Table
+                    {/if}
+                </button>
+            </div>
+            {#if customDecayRows.length}
+                <table class="optimization-popup-table">
+                    <thead>
+                        <tr>
+                            <th>Decay</th>
+                            <th>Log loss</th>
+                            <th>Delta</th>
+                            <th>RMSE (bins)</th>
+                            <th>Delta</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {#each customDecayRows as row}
+                            <tr>
+                                <th>
+                                    {formatDecay(row.decay)}
+                                    {#if row.isBaseline}
+                                        (optimized)
+                                    {/if}
+                                </th>
+                                <td>{formatMetric(row.logLoss)}</td>
+                                <td
+                                    class={`optimize-delta ${deltaClass(row.logLossDelta)}`}
+                                >
+                                    {formatDelta(row.logLossDelta)}
+                                    ({formatPercentDelta(row.logLossDeltaPercent)})
+                                </td>
+                                <td>{formatMetric(row.rmseBins)}</td>
+                                <td
+                                    class={`optimize-delta ${deltaClass(row.rmseDelta)}`}
+                                >
+                                    {formatDelta(row.rmseDelta)}
+                                    ({formatPercentDelta(row.rmseDeltaPercent)})
+                                </td>
+                            </tr>
+                        {/each}
+                    </tbody>
+                </table>
+            {/if}
+            <div class="optimization-popup-footer">
+                <button class="btn btn-secondary" on:click={keepCurrentParams}>
+                    Keep Current
+                </button>
+                <button class="btn btn-primary" on:click={applyOptimizedParams}>
+                    Use Optimized
+                </button>
+            </div>
+        </div>
+    </div>
+{/if}
+
 <style>
     .btn {
         margin-bottom: 0.375rem;
+    }
+
+    .fsrs-advanced {
+        border-top: 1px solid var(--border);
+        padding-top: 0.75rem;
+    }
+
+    .fsrs-advanced summary {
+        cursor: pointer;
+        font-weight: 700;
+        margin-bottom: 0.75rem;
+    }
+
+    .interval-preview {
+        margin-bottom: 0.75rem;
+        overflow-x: auto;
+    }
+
+    .interval-preview-title {
+        font-weight: 600;
+        margin-bottom: 0.375rem;
+    }
+
+    .interval-preview-table {
+        width: 100%;
+        font-size: 0.9rem;
+        border-collapse: collapse;
+    }
+
+    .interval-preview-table th,
+    .interval-preview-table td {
+        padding: 0.35rem 0.5rem;
+        border: 1px solid var(--border);
+        text-align: left;
+        white-space: nowrap;
+    }
+
+    .interval-preview-table thead th {
+        background: var(--canvas-elevated);
+    }
+
+    .interval-preview-table tr.interval-again th,
+    .interval-preview-table tr.interval-again td {
+        color: var(--fg-red, #b42318);
+    }
+
+    .interval-preview-table tr.interval-hard th,
+    .interval-preview-table tr.interval-hard td {
+        color: var(--fg-orange, #b54708);
+    }
+
+    .interval-preview-table tr.interval-good th,
+    .interval-preview-table tr.interval-good td {
+        color: var(--fg-green, #027a48);
+    }
+
+    .interval-preview-table tr.interval-easy th,
+    .interval-preview-table tr.interval-easy td {
+        color: var(--fg-light-green, #12b76a);
     }
 
     :global(.two-line) {
@@ -513,8 +2089,115 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         flex-wrap: wrap;
     }
 
-    hr {
-        border-top: 1px solid var(--border);
-        opacity: 1;
+    .optimization-popup-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.45);
+        z-index: 1060;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 1rem;
+    }
+
+    .optimization-popup {
+        width: min(760px, 95vw);
+        max-width: calc(100vw - 2rem);
+        background: var(--canvas);
+        border: 1px solid var(--border);
+        border-radius: 0.5rem;
+        box-shadow: 0 0.75rem 2.25rem rgba(0, 0, 0, 0.2);
+        overflow-x: auto;
+    }
+
+    .optimization-popup-wide {
+        width: max-content;
+    }
+
+    .optimization-popup-header {
+        font-weight: 700;
+        padding: 0.75rem 1rem 0.5rem;
+    }
+
+    .optimization-popup-table {
+        width: calc(100% - 2rem);
+        margin: 0 1rem 0.75rem;
+        border-collapse: collapse;
+        font-size: 0.9rem;
+    }
+
+    .same-day-comparison-table {
+        width: max-content;
+        min-width: calc(100% - 2rem);
+    }
+
+    .same-day-recommendation {
+        margin: 0 1rem 0.75rem;
+        padding: 0.5rem 0.75rem;
+        border: 1px solid var(--border);
+        border-radius: 0.375rem;
+        font-size: 0.9rem;
+    }
+
+    .same-day-recommendation.better {
+        color: var(--fg-green, #027a48);
+        border-color: var(--fg-green, #027a48);
+    }
+
+    .same-day-recommendation.worse {
+        color: var(--fg-red, #b42318);
+        border-color: var(--fg-red, #b42318);
+    }
+
+    .optimization-popup-table th,
+    .optimization-popup-table td {
+        border: 1px solid var(--border);
+        padding: 0.35rem 0.5rem;
+        text-align: right;
+        white-space: nowrap;
+    }
+
+    .optimization-popup-table th:first-child,
+    .optimization-popup-table td:first-child {
+        text-align: left;
+    }
+
+    .optimization-popup-footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 0.5rem;
+        padding: 0 1rem 1rem;
+    }
+
+    .optimization-popup-actions {
+        padding: 0 1rem 0.25rem;
+    }
+
+    .dynamic-dr-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin: 0.5rem 0 0.75rem;
+        font-size: 0.9rem;
+    }
+
+    .fsrs-progress {
+        width: min(24rem, 100%);
+        height: 0.5rem;
+        margin-top: 0.35rem;
+    }
+
+    .optimize-delta.better {
+        color: var(--fg-green, #027a48);
+        font-weight: 600;
+    }
+
+    .optimize-delta.worse {
+        color: var(--fg-red, #b42318);
+        font-weight: 600;
+    }
+
+    .optimize-delta.equal {
+        color: var(--fg, inherit);
     }
 </style>

@@ -21,6 +21,8 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     import Warning from "./Warning.svelte";
 
     export let value: number[];
+    export let validParamCounts = [0, 17, 19, 21, 34];
+    export let ariaLabel = "FSRS Parameters";
 
     let stringValue: string;
     let taRef: HTMLTextAreaElement;
@@ -42,17 +44,21 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
         return params.map((v) => v.toFixed(4)).join(", ");
     }
 
-    const validParamCounts = [0, 17, 19, 21];
-
     function update(e: Event): void {
         const input = e.target as HTMLTextAreaElement;
+        if (input.value === stringValue) {
+            return;
+        }
         const newValue = input.value
             .replace(/ /g, "")
             .split(",")
             .filter((e) => e)
             .map((v) => Number(v));
 
-        if (validParamCounts.includes(newValue.length)) {
+        if (
+            validParamCounts.includes(newValue.length) &&
+            newValue.every((v) => Number.isFinite(v))
+        ) {
             value = newValue;
         } else {
             alert(tr.deckConfigInvalidParameters());
@@ -87,7 +93,7 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     on:click={onClick}
     on:keypress={onClick}
     role="button"
-    aria-label={"FSRS Parameters"}
+    aria-label={ariaLabel}
     tabindex={unlocked ? -1 : 0}
 >
     <textarea

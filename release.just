@@ -1,28 +1,47 @@
 set windows-shell := ["pwsh", "-NoLogo", "-NoProfileLoadTime", "-Command"]
 
 version := `cat .version`
+python := if os() == "windows" { "python" } else { "python3" }
 
-# Prepare a release: validate version, check CI, update .version
+[private]
+check-ci ref skip-ci-check:
+    {{ if skip-ci-check == "true" { "echo Skipping local CI preflight" } else { python + " .github/scripts/wait_for_ci.py --repo JSchoreels/anki --commit \"" + ref + "\"" } }}
+
+# Prepare a release: validate version, check CI, and update .version on the branch
 [arg("version", long)]
+[arg("ref", long)]
 [arg("skip-ci-check", long)]
-prepare version skip-ci-check="false":
-    python3 tools/prepare_release.py "{{ version }}" \
-        {{ if skip-ci-check == "true" { "--skip-ci-check" } else { "" } }}
+prepare version ref skip-ci-check="false":
+    gh workflow run prepare-release.yml --repo JSchoreels/anki --ref {{ ref }} \
+        -f version="{{ version }}" \
+        -f skip-ci-check={{ skip-ci-check }}
 
 # Build all platforms, no signing or publishing
 [arg("ref", long)]
 build ref:
-    gh workflow run release.yml --ref {{ ref }} \
+    gh workflow run release.yml --repo JSchoreels/anki --ref {{ ref }} \
         -f version="{{ version }}" \
         -f sign=false \
         -f draft-release=false \
         -f publish-testpypi=false \
         -f publish-pypi=false
 
+# Build all platforms and create an unsigned draft GitHub release
+[arg("ref", long)]
+[arg("skip-ci-check", long)]
+draft ref="main" skip-ci-check="false": (check-ci ref skip-ci-check)
+    gh workflow run release.yml --repo JSchoreels/anki --ref {{ ref }} \
+        -f version="{{ version }}" \
+        -f skip-ci-check={{ skip-ci-check }} \
+        -f sign=false \
+        -f draft-release=true \
+        -f publish-testpypi=false \
+        -f publish-pypi=false
+
 # Build and sign artifacts
 [arg("ref", long)]
 sign ref:
-    gh workflow run release.yml --ref {{ ref }} \
+    gh workflow run release.yml --repo JSchoreels/anki --ref {{ ref }} \
         -f version="{{ version }}" \
         -f sign=true \
         -f draft-release=false \
@@ -32,7 +51,7 @@ sign ref:
 # Full public release: sign, draft, testpypi, pypi
 [arg("ref", long)]
 public ref:
-    gh workflow run release.yml --ref {{ ref }} \
+    gh workflow run release.yml --repo JSchoreels/anki --ref {{ ref }} \
         -f version="{{ version }}" \
         -f sign=true \
         -f draft-release=true \
@@ -42,7 +61,7 @@ public ref:
 # Publish Python packages to TestPyPI only
 [arg("ref", long)]
 testpypi ref:
-    gh workflow run release.yml --ref {{ ref }} \
+    gh workflow run release.yml --repo JSchoreels/anki --ref {{ ref }} \
         -f version="{{ version }}" \
         -f sign=false \
         -f draft-release=false \
@@ -52,7 +71,7 @@ testpypi ref:
 # Publish Python packages to TestPyPI and PyPI
 [arg("ref", long)]
 pypi ref:
-    gh workflow run release.yml --ref {{ ref }} \
+    gh workflow run release.yml --repo JSchoreels/anki --ref {{ ref }} \
         -f version="{{ version }}" \
         -f sign=false \
         -f draft-release=false \
@@ -67,7 +86,7 @@ pypi ref:
 [arg("publish-pypi", long)]
 [arg("skip-ci-check", long)]
 custom ref sign="false" draft-release="false" publish-testpypi="false" publish-pypi="false" skip-ci-check="false":
-    gh workflow run release.yml --ref {{ ref }} \
+    gh workflow run release.yml --repo JSchoreels/anki --ref {{ ref }} \
         -f version="{{ version }}" \
         -f sign={{ sign }} \
         -f draft-release={{ draft-release }} \

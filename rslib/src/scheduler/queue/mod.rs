@@ -7,11 +7,13 @@ mod learning;
 mod main;
 pub(crate) mod undo;
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use anki_proto::scheduler::SchedulingContext;
 pub(crate) use builder::DueCard;
 pub(crate) use builder::DueCardKind;
+pub(crate) use builder::DueCardWithState;
 pub(crate) use builder::NewCard;
 pub(crate) use entry::QueueEntry;
 pub(crate) use entry::QueueEntryKind;
@@ -23,6 +25,7 @@ use self::undo::QueueUpdate;
 use super::states::SchedulingStates;
 use super::timing::SchedTimingToday;
 use crate::prelude::*;
+use crate::scheduler::rwkv::RwkvReviewScoreEligibility;
 use crate::scheduler::states::load_balancer::LoadBalancer;
 use crate::timestamp::TimestampSecs;
 
@@ -38,9 +41,49 @@ pub(crate) struct CardQueues {
     /// counts are zero. Ensures we don't show a newly-due learning card after a
     /// user returns from editing a review card.
     current_learning_cutoff: TimestampSecs,
+    shown_top_card: Option<CardId>,
+    non_news_sorted_by_retrievability: bool,
+    deferred_rwkv_reviews: HashMap<CardId, DeferredRwkvReview>,
     pub(crate) load_balancer: Option<LoadBalancer>,
     pub(crate) fsrs_enabled: bool,
     pub(crate) fsrs_short_term_with_steps: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeferredRwkvReview {
+    pub(crate) required_intervening_reviews: Option<u32>,
+    pub(crate) intervening_reviews: Option<u32>,
+    pub(crate) eligible_at: Option<TimestampSecs>,
+}
+
+impl DeferredRwkvReview {
+    pub(crate) fn from_eligibility(
+        eligibility: RwkvReviewScoreEligibility,
+        now: TimestampSecs,
+    ) -> Option<Self> {
+        match eligibility {
+            RwkvReviewScoreEligibility::Deferred {
+                required_intervening_reviews,
+                intervening_reviews,
+                remaining_elapsed_secs,
+            } => Some(Self {
+                required_intervening_reviews,
+                intervening_reviews,
+                eligible_at: remaining_elapsed_secs
+                    .map(|remaining| now.adding_secs(remaining.into())),
+            }),
+            RwkvReviewScoreEligibility::Eligible | RwkvReviewScoreEligibility::Blocked => None,
+        }
+    }
+
+    fn is_ready(self, now: TimestampSecs) -> bool {
+        self.required_intervening_reviews.map_or(true, |required| {
+            self.intervening_reviews
+                .is_some_and(|reviews| reviews >= required)
+        }) && self
+            .eligible_at
+            .map_or(true, |eligible_at| now >= eligible_at)
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -60,7 +103,7 @@ impl Counts {
 pub struct QueuedCard {
     pub card: Card,
     pub kind: QueueEntryKind,
-    pub states: SchedulingStates,
+    pub states: Option<SchedulingStates>,
     pub context: SchedulingContext,
 }
 
@@ -83,7 +126,7 @@ pub(crate) struct BuryMode {
 
 impl Collection {
     pub fn get_next_card(&mut self) -> Result<Option<QueuedCard>> {
-        self.get_queued_cards(1, false)
+        self.get_queued_cards(1, false, false)
             .map(|queued| queued.cards.first().cloned())
     }
 
@@ -91,6 +134,7 @@ impl Collection {
         &mut self,
         fetch_limit: usize,
         intraday_learning_only: bool,
+        skip_scheduling_states: bool,
     ) -> Result<QueuedCards> {
         let queues = self.get_queues()?;
         let counts = queues.counts();
@@ -103,6 +147,9 @@ impl Collection {
         } else {
             queues.iter().take(fetch_limit).collect()
         };
+        if fetch_limit == 1 && !intraday_learning_only {
+            queues.mark_top_card_shown(entries.first().map(QueueEntry::card_id));
+        }
         let cards: Vec<_> = entries
             .into_iter()
             .map(|entry| {
@@ -118,8 +165,12 @@ impl Collection {
                     entry.mtime()
                 );
 
-                let (next_states, card) = self.get_scheduling_states_inner(card)?;
-
+                let (next_states, card) = if skip_scheduling_states {
+                    (None, card)
+                } else {
+                    let (states, card) = self.get_scheduling_states_inner(card)?;
+                    (Some(states), card)
+                };
                 Ok(QueuedCard {
                     context: new_scheduling_context(self, &card)?,
                     card,
@@ -150,13 +201,74 @@ fn new_scheduling_context(col: &mut Collection, card: &Card) -> Result<Schedulin
 }
 
 impl CardQueues {
+    pub(crate) fn main_contains(&self, card_id: CardId) -> bool {
+        self.main.iter().any(|entry| entry.id == card_id)
+    }
+
+    pub(crate) fn update_deferred_rwkv_intervening_reviews(
+        &mut self,
+        intervening_reviews_by_card_id: &HashMap<CardId, u32>,
+    ) -> bool {
+        let now = TimestampSecs::now();
+        let mut rebuild_required = false;
+        for (card_id, intervening_reviews) in intervening_reviews_by_card_id {
+            if let Some(deferred) = self.deferred_rwkv_reviews.get_mut(card_id) {
+                deferred.intervening_reviews = Some(*intervening_reviews);
+                rebuild_required |= deferred.is_ready(now);
+            }
+        }
+        rebuild_required
+    }
+
+    pub(crate) fn defer_rwkv_review(&mut self, card_id: CardId, deferred: DeferredRwkvReview) {
+        self.deferred_rwkv_reviews.insert(card_id, deferred);
+    }
+
+    pub(crate) fn remove_deferred_rwkv_review(&mut self, card_id: CardId) {
+        self.deferred_rwkv_reviews.remove(&card_id);
+    }
+
+    fn deferred_rwkv_review_is_ready(&self) -> bool {
+        let now = TimestampSecs::now();
+        self.deferred_rwkv_reviews
+            .values()
+            .any(|deferred| deferred.is_ready(now))
+    }
+
+    fn mark_top_card_shown(&mut self, card_id: Option<CardId>) {
+        self.shown_top_card = card_id;
+    }
+
+    fn preserve_current_card(&mut self, card_id: CardId) -> Result<()> {
+        if let Some(position) = self.main.iter().position(|entry| entry.id == card_id) {
+            let entry = self.main.remove(position).unwrap();
+            self.main.push_front(entry);
+        } else {
+            require!(
+                self.intraday_learning
+                    .iter()
+                    .any(|entry| entry.id == card_id),
+                "current card missing from rebuilt queue"
+            );
+        }
+        self.mark_top_card_shown(Some(card_id));
+        Ok(())
+    }
+
     /// An iterator over the card queues, in the order the cards will
     /// be presented.
     fn iter(&self) -> impl Iterator<Item = QueueEntry> + '_ {
-        self.intraday_now_iter()
-            .map(Into::into)
+        let intraday_now = (!self.non_news_sorted_by_retrievability)
+            .then_some(())
+            .into_iter()
+            .flat_map(|_| self.intraday_now_iter().map(Into::into));
+        let intraday_ahead = (!self.non_news_sorted_by_retrievability)
+            .then_some(())
+            .into_iter()
+            .flat_map(|_| self.intraday_ahead_iter().map(Into::into));
+        intraday_now
             .chain(self.main.iter().map(Into::into))
-            .chain(self.intraday_ahead_iter().map(Into::into))
+            .chain(intraday_ahead)
     }
 
     /// Remove the provided card from the top of the queues and
@@ -168,8 +280,10 @@ impl CardQueues {
             // under normal circumstances this should not go below 0, but currently
             // the Python unit tests answer learning cards before they're due
             self.counts.learning = self.counts.learning.saturating_sub(1);
+            self.shown_top_card = None;
             Ok(entry.into())
         } else if self.main.front().filter(|e| e.id == id).is_some() {
+            self.shown_top_card = None;
             Ok(self.pop_main().unwrap().into())
         } else {
             invalid_input!("not at top of queue")
@@ -177,6 +291,7 @@ impl CardQueues {
     }
 
     fn push_undo_entry(&mut self, entry: QueueEntry) {
+        self.shown_top_card = None;
         match entry {
             QueueEntry::IntradayLearning(entry) => self.push_intraday_learning(entry),
             QueueEntry::Main(entry) => self.push_main(entry),
@@ -187,7 +302,7 @@ impl CardQueues {
     /// cutoff is updated to the current time first, and any newly-due learning
     /// cards are added to the counts.
     pub(crate) fn counts(&mut self) -> Counts {
-        if self.counts.all_zero() {
+        if self.counts.all_zero() && !self.non_news_sorted_by_retrievability {
             // we discard the returned undo information in this case
             self.update_learning_cutoff_and_count();
         }
@@ -197,9 +312,39 @@ impl CardQueues {
     fn is_stale(&self, current_day: u32) -> bool {
         self.current_day != current_day
     }
+
+    fn due_intraday_needs_retrievability_resort(&self) -> bool {
+        self.non_news_sorted_by_retrievability
+            && self
+                .intraday_learning
+                .front()
+                .map(|entry| entry.due <= TimestampSecs::now())
+                .unwrap_or(false)
+    }
 }
 
 impl Collection {
+    pub(crate) fn rebuild_queued_cards_preserving_current_card(
+        &mut self,
+        current_card_id: CardId,
+    ) -> Result<QueuedCards> {
+        let deck = self.get_current_deck()?;
+        self.clear_queues_if_day_changed()?;
+        let card = self
+            .storage
+            .get_card(current_card_id)?
+            .or_not_found(current_card_id)?;
+        let mut queues = self.build_queues_with_current_card(deck.id, Some(&card))?;
+        let counts = queues.counts();
+        self.state.card_queues = Some(queues);
+        Ok(QueuedCards {
+            cards: vec![],
+            new_count: counts.new,
+            learning_count: counts.learning,
+            review_count: counts.review,
+        })
+    }
+
     /// This is automatically done when transact() is called for everything
     /// except card answers, so unless you are modifying state outside of a
     /// transaction, you probably don't need this.
@@ -245,7 +390,17 @@ impl Collection {
     pub(crate) fn get_queues(&mut self) -> Result<&mut CardQueues> {
         let deck = self.get_current_deck()?;
         self.clear_queues_if_day_changed()?;
-        if self.state.card_queues.is_none() {
+        if self.state.card_queues.is_none()
+            || self
+                .state
+                .card_queues
+                .as_ref()
+                .map(|queues| {
+                    queues.due_intraday_needs_retrievability_resort()
+                        || queues.deferred_rwkv_review_is_ready()
+                })
+                .unwrap_or(false)
+        {
             self.state.card_queues = Some(self.build_queues(deck.id)?);
         }
 
@@ -293,8 +448,31 @@ impl Collection {
 #[cfg(test)]
 impl Collection {
     pub(crate) fn counts(&mut self) -> [usize; 3] {
-        self.get_queued_cards(1, false)
+        self.get_queued_cards(1, false, false)
             .map(|q| [q.new_count, q.learning_count, q.review_count])
             .unwrap_or([0; 3])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_rwkv_review_requires_every_guard_to_be_ready() {
+        let now = TimestampSecs(100);
+        let mut deferred = DeferredRwkvReview {
+            required_intervening_reviews: Some(2),
+            intervening_reviews: Some(1),
+            eligible_at: Some(TimestampSecs(99)),
+        };
+        assert!(!deferred.is_ready(now));
+
+        deferred.intervening_reviews = Some(2);
+        deferred.eligible_at = Some(TimestampSecs(101));
+        assert!(!deferred.is_ready(now));
+
+        deferred.eligible_at = Some(now);
+        assert!(deferred.is_ready(now));
     }
 }

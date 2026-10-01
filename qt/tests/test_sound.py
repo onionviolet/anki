@@ -1,18 +1,79 @@
 # Copyright: Ankitects Pty Ltd and contributors
 # License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
+from __future__ import annotations
+
 import shutil
 import subprocess
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 import aqt
+import aqt.sound
 from anki.sound import SoundOrVideoTag
 from anki.utils import is_lin, is_mac, is_win
-from aqt.sound import MpvManager, _packagedCmd, is_audio_file
+from aqt.sound import MpvManager, SimpleProcessPlayer, _packagedCmd, is_audio_file
+
+
+class _ProcessPlayer(SimpleProcessPlayer):
+    def rank_for_tag(self, tag) -> int:
+        return 0
+
+
+class FakeTaskman:
+    def run_on_main(self, fn: Callable[[], None]) -> None:
+        fn()
+
+
+class FakeStdin:
+    closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class SlowToStopProcess:
+    args = ["player"]
+    returncode = 0
+
+    def __init__(self) -> None:
+        self.stdin = FakeStdin()
+        self.terminated = False
+        self.killed = False
+        self._first_wait = True
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        if timeout == 1 and self._first_wait:
+            self._first_wait = False
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        return self.returncode
+
+
+def test_stopping_slow_player_kills_process(monkeypatch) -> None:
+    monkeypatch.setattr(
+        aqt.sound.gui_hooks, "av_player_did_begin_playing", lambda *_args: None
+    )
+    player = _ProcessPlayer(FakeTaskman())
+    process = SlowToStopProcess()
+    player._process = process
+    player._terminate_flag = True
+
+    player._wait_for_termination(object())
+
+    assert process.terminated
+    assert process.killed
+    assert process.stdin.closed
+    assert player._process is None
 
 
 def test_is_audio_file_recognizes_common_formats():
@@ -26,7 +87,6 @@ def test_is_audio_file_is_case_insensitive():
 
 
 def test_is_audio_file_rejects_non_audio():
-    # mp4/avi are video-only; jpg/png/pdf are not media Anki plays via mpv.
     for ext in ("mp4", "avi", "jpg", "png", "pdf"):
         assert not is_audio_file(f"test.{ext}")
 
@@ -36,9 +96,6 @@ def test_is_audio_file_rejects_no_extension():
 
 
 def test_packagedcmd_returns_absolute_path_when_anki_audio_available():
-    # _packagedCmd should prefer the binary bundled in anki_audio over a
-    # system-wide one on macOS and Windows. This is the regression caught by
-    # issue #5015: an updated anki_audio build was not being picked up.
     if not (is_mac or is_win):
         pytest.skip("anki_audio binary preference is only used on macOS/Windows")
 
