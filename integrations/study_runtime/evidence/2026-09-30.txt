@@ -1,0 +1,32 @@
+Runtime acceptance: 2026-09-30 America/New_York
+Anki: 26.09.3 development app; baseline HEAD 4b4211c5a4482ea94bd1a07a7c32aa042f6e3269; uncommitted Study tools
+FSRS Helper source: 29208f220f21ff994c199712a6aaac47636773bf
+python-i18n source: 4b7deea70b07b4286c96a59cc176abe14784b360
+Single-instance key: unique temporary-base name; media-server 40019; AnkiConnect 8779
+Run: STUDY_RUNTIME_HELPER_SOURCE=<source checkout with submodule> STUDY_RUNTIME_AUDIO=<local system-voice WAV> just study-runtime
+Native file selectors and expected-warning presentation replaced; app/event loop/operations/webview/API/player real.
+
+f4a80f48a36f6143e4563feee3f96cb1e68fed636697c97afb8899b11772ad5e  qt/aqt/weibao/study_data.py
+faecc3ea6977ff2814edf856471e22184d74e36b98edc1b00af5bf772208ac33  qt/aqt/weibao/study_dialog.py
+ac293a97b5d8305dd97e6991a646ef955d353b10df5bc8375101a7439a0147ef  integrations/study_runtime/probe.py
+
+INFO optional provider dependencies: databind=absent, pydub=absent
+PASS optional FSRS Helper loads alongside Study tools with automatic scheduling disabled
+PASS Tools entry and real asynchronous overview/repair/setup
+PASS proposal export/import/accept/undo, protected import and stale write rejection
+PASS AnkiConnect v6 fields/duplicates/guiAddCards: browser draft opens without adding a note
+PASS capture preview/add/duplicate rejection/undo, source metadata and real MPV playback completion
+PASS planned break preview/apply/undo and stale schedule rejection
+PASS retention comparison leaves every collection table and undo unchanged
+PASS deck-home JS entry
+PASS profile switch drops late query callback and closes dashboard; fresh profile has no old data
+PASS all
+PASS safe mode: no Study tools menu/home hook, bundled API or test add-on loaded
+
+Final code gate: just check passed; unchanged targets reused prior passing build stamps.
+Python/Qt validation: just test-py passed 150 Qt tests; MPV leak absent.
+Final formatting changed study_dialog import ordering/signature wrapping only after the runtime run.
+Final packaged source f4a80f48a36f6143e4563feee3f96cb1e68fed636697c97afb8899b11772ad5e  qt/aqt/weibao/study_data.py
+Final packaged source faecc3ea6977ff2814edf856471e22184d74e36b98edc1b00af5bf772208ac33  qt/aqt/weibao/study_dialog.py
+aqt wheel SHA256: 9f9c5f20ed80fccd91761f2184919f1c01df75c71ffbfc96f206bc9379aa4a75
+anki wheel SHA256: 33cb02f3c16de76dcf9a24bfa0526cbe89e4aef36564f2f55d9f04cc727338ad

@@ -136,10 +136,14 @@ impl Collection {
             .get_revlog_entries_for_searched_cards_in_card_order()?;
         let mut cards = guard.col.storage.all_searched_cards()?;
         drop(guard);
-        // calculate any missing memory state
+        // Calculate missing memory state only on the simulation's local copies.
+        // A preview must not update the collection or its sync/undo state.
         for c in &mut cards {
             if is_included_card(c) && c.memory_state.is_none() {
-                self.compute_and_update_memory_state(c)?;
+                let data = self.compute_memory_state(c.id)?;
+                c.memory_state = data.state.map(Into::into);
+                c.desired_retention = Some(data.desired_retention);
+                c.decay = Some(data.decay);
             }
         }
         let days_elapsed = self.timing_today().unwrap().days_elapsed as i32;
@@ -462,6 +466,25 @@ mod test {
             cards.iter().map(|c| c.desired_retention).collect_vec()
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn simulation_does_not_persist_missing_memory_state() -> Result<()> {
+        let mut col = Collection::new();
+        let note = crate::tests::NoteAdder::basic(&mut col).add(&mut col);
+        let cid = CardId(col.cards_of_note(note.id.into())?.cids[0]);
+        col.grade_now(&[cid], 3)?;
+        col.set_config_bool(BoolKey::Fsrs, true, false)?;
+        let before = col.storage.get_card(cid)?.unwrap();
+        assert!(before.memory_state.is_none());
+
+        let mut req = base_request();
+        req.deck_size = 0;
+        let (_, converted) = col.simulate_request_to_config(&req)?;
+
+        assert_eq!(converted.len(), 1);
+        assert_eq!(col.storage.get_card(cid)?.unwrap(), before);
         Ok(())
     }
 

@@ -1026,6 +1026,9 @@ title="{}" {}>{}</button>""".format(
             from aqt.weibao.ankiconnect import install as install_ankiconnect
 
             install_ankiconnect(self)
+            from aqt.weibao.study_dialog import install as install_study_tools
+
+            install_study_tools(self)
 
     def maybe_check_for_addon_updates(
         self, on_done: Callable[[list[DownloadLogEntry]], None] | None = None

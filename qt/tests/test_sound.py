@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import wave
 from pathlib import Path
+from threading import Event
 from unittest.mock import MagicMock
 
 import pytest
@@ -121,5 +122,13 @@ def test_mpvmanager_can_play_generated_wav(
         lambda task, on_done=None, **kwargs: task()
     )
     monkeypatch.setattr(aqt, "mw", mock_mw)
+    # MPV reports completion on its reader thread. Keep the test window alive
+    # until that callback arrives, and close the process before monkeypatch undo.
+    finished = Event()
+    mock_mw.taskman.run_on_main.side_effect = lambda callback: callback()
     manager = MpvManager(tmp_path, tmp_path)
-    manager.play(SoundOrVideoTag(filename=str(generated_wav.name)), lambda _: None)
+    try:
+        manager.play(SoundOrVideoTag(filename=str(generated_wav.name)), finished.set)
+        assert finished.wait(10), "MPV did not finish playing the generated WAV"
+    finally:
+        manager.shutdown()

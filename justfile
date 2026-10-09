@@ -14,6 +14,21 @@ build:
 run *args:
     {{ run_script }} {{ args }}
 
+# Verify Study tools in a fresh synthetic full-application profile
+study-runtime:
+    just build
+    PYTHONPATH=pylib:qt:out/pylib:out/qt out/pyenv/bin/python integrations/study_runtime/launch.py
+
+# Create local audio; Han text defaults to Mandarin, with optional language/voice/rate
+local-speech text output lang='auto' voice='' rate='170':
+    PYTHONPATH=pylib python3 integrations/local_speech.py {{ quote(text) }} {{ quote(output) }} --lang {{ quote(lang) }} --voice {{ quote(voice) }} --rate {{ quote(rate) }}
+
+# Format and lint the standalone optional integration/runtime tooling
+study-tools-check:
+    just build
+    out/pyenv/bin/ruff check --select E4,E7,E9,F,I --fix integrations/local_speech.py integrations/study_runtime
+    out/pyenv/bin/ruff format integrations/local_speech.py integrations/study_runtime
+
 # Run the bundled ankictl client against a running Anki instance
 bridge *args:
     python3 integrations/ankictl/ankictl.py {{ args }}

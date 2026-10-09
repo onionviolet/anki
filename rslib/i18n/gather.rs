@@ -43,6 +43,8 @@ pub fn get_ftl_data() -> TranslationsByLang {
 
 /// For each .ftl file in the provided folder, add it to the translation map.
 fn add_folder(map: &mut TranslationsByLang, folder: &Path, repo: &str, lang: &str) {
+    // New or removed modules must invalidate Cargo's cached generated interfaces.
+    println!("cargo:rerun-if-changed={}", folder.display());
     let map_entry = map.entry(lang.to_string()).or_default();
     for entry in fs::read_dir(folder).unwrap() {
         let entry = entry.unwrap();
