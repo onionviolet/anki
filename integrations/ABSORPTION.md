@@ -109,9 +109,9 @@ The post-fix `just test-py` run passed 150 Qt tests (including the corrected MPV
 - `aqt`: `9f9c5f20ed80fccd91761f2184919f1c01df75c71ffbfc96f206bc9379aa4a75`
 - `anki`: `33cb02f3c16de76dcf9a24bfa0526cbe89e4aef36564f2f55d9f04cc727338ad`
 
-All work remains uncommitted. No daily app, profile, collection, browser integration setting, provider credential or production scheduler was changed during this continuation. Installed-app validation and human acceptance are not inferred from these gates.
+That September 30 checkpoint preceded the integration commits recorded below. No daily app, profile, collection, browser integration setting, provider credential or production scheduler was changed during that continuation. Installed-app validation and human acceptance are not inferred from these gates.
 
-## Integration gate, October 9, 2026
+## Phases 1 and 2 integration gate, October 9, 2026
 
 Phase 1 integrates origin PR #1 and retains the official AnkiConnect version, Chinese Support packaging and study tools. The simulator uses a shared non-persisting memory-state helper. Retention requests select the preset's FSRS parameter version explicitly by parameter length and include dynamic-retention settings; empty presets use the corresponding backend defaults.
 
@@ -146,3 +146,9 @@ The C7/#5758 `just check` gate passed: 187 TypeScript tests and 1,182 Qt tests (
 [Upstream PR #5761](https://github.com/ankitects/anki/pull/5761), fetched head [`e70642658`](https://github.com/ankitects/anki/commit/e7064265840e35226e40c1803bd23e46b0c84290), contributes the backend feature from [`5638ff148`](https://github.com/ankitects/anki/commit/5638ff1485b96da072e70e014a3a5442e56ae2e4). Only the stats proto, graph response mapping, hourly aggregation and its test are absorbed, plus the contributor license entry from [`9b4c64296`](https://github.com/ankitects/anki/commit/9b4c64296d152586be6f8bc63d70ed0420d9757e). No heatmap UI is added. The test initializes the fork's extra graph-context maps and checks local hours, Anki day keys, filtered reviews, and excluded manual/rescheduled entries.
 
 The C6/#5761 `just check` gate passed: 1,194 Rust tests (13 skipped), 1,182 Qt tests (6 skipped), 215 pylib tests and 187 TypeScript tests, including the new hourly-data regression. C3 (later-only rescheduling) and C5 (sibling dispersal) remain follow-ups; C8 remains out of scope.
+
+## Final integration verification, October 9, 2026
+
+`just study-runtime` passed on the final integrated source, including both normal and safe mode in a new synthetic temporary base. The [transcript](study_runtime/evidence/2026-10-09.txt) records the real application and asynchronous operation checks. `just wheels` built both desktop wheels; archive inspection verified study/TTS source bytes, the built bridge, hourly stats data and bundled integration licenses. The final `just check` gate reuses passing source stamps: 1,194 Rust tests (13 skipped), 1,182 Qt tests (6 skipped), 215 pylib tests, 187 TypeScript tests and 84 tooling tests. Phase 4 e2e passed 47 tests, 1 skipped.
+
+The [outcome report](REVIEW-2026-10-08.md) records per-phase conflicts, resolutions, commits and gates. These are source, runtime and packaging results. Installed-app validation and human acceptance remain open. No daily app/profile/collection write, push or PR occurred.

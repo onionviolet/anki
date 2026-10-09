@@ -1,0 +1,14 @@
+Integration runtime, October 9, 2026
+just study-runtime: exit 0; newly created synthetic base, normal and safe mode.
+
+INFO optional provider dependencies: databind=absent, pydub=absent
+PASS Tools entry and real asynchronous overview/repair/setup
+PASS proposal export/import/accept/undo, protected import and stale write rejection
+PASS AnkiConnect v6 fields/duplicates/guiAddCards: browser draft opens without adding a note
+PASS capture preview/add/duplicate rejection/undo, source metadata and real MPV playback completion
+PASS planned break preview/apply/undo and stale schedule rejection
+PASS retention comparison leaves every collection table and undo unchanged
+PASS deck-home JS entry
+PASS profile switch drops late query callback and closes dashboard; fresh profile has no old data
+PASS all
+PASS safe mode: no Study tools menu/home hook, bundled API or test add-on loaded
