@@ -128,3 +128,9 @@ The required `just check` gate passed: 1,112 Rust tests (11 skipped), 200 pylib 
 | C4   | [Numeric search 77fe167](https://github.com/JSchoreels/anki/commit/77fe16700d7491455aaf62ab37ac27c7e3acca17), [follow-up d689b78](https://github.com/JSchoreels/anki/commit/d689b78a47bf70e8f9d027ce93de67069f273fec) | Both commits are already included by the Phase 4 merge; no duplicate absorption is needed.                                                                                                                                                                                                               |
 
 Phase 4 source gate passed: 1,193 Rust tests (13 skipped), 1,182 Qt tests (6 skipped), 215 pylib tests, and 179 TypeScript tests. The FSRS6 sync regression is an enabled test in the passing Rust suite. The simulator's non-persisting helper is preserved and reused for card-stat metadata. `just test-e2e` passed 47 tests with 1 skipped using an isolated synthetic application.
+
+### C7: image occlusion mask coordinates
+
+[Upstream PR #5751](https://github.com/ankitects/anki/pull/5751), commit [`00814718e`](https://github.com/ankitects/anki/commit/00814718e5ca2ad61a2410119effd4cb40f5667e), is not included in the fetched upstream main. It preserves fractional mask coordinates instead of rounding pixels during conversion and includes round-trip regression tests. The contributor-list conflict retains both upstream entries and the source author.
+
+The C7/#5751 `just check` gate passed: 187 TypeScript tests and 1,182 Qt tests (6 skipped). Unchanged Rust and pylib targets reused the Phase 4 passing stamps.
