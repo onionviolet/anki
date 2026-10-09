@@ -193,7 +193,7 @@ def capture_note(col: Collection, draft: CaptureDraft) -> Note:
         raise ValueError("The note type changed. Reload the capture form.")
     for field, text in fields.items():
         # Capture is plain text; preserve cloze braces but not pasted HTML/scripts.
-        note[field] = html.escape(text).replace("\n", "<br>")
+        note[field] = html.escape(text, quote=False).replace("\n", "<br>")
     if draft.source_url or draft.source_title:
         if draft.source_field not in fields:
             raise ValueError("Choose a field for the source metadata.")
@@ -203,7 +203,9 @@ def capture_note(col: Collection, draft: CaptureDraft) -> Note:
         ):
             raise ValueError("Source URLs must use http or https.")
         source = "<br>".join(
-            html.escape(text) for text in (draft.source_title, draft.source_url) if text
+            html.escape(text, quote=False)
+            for text in (draft.source_title, draft.source_url)
+            if text
         )
         note[draft.source_field] += (
             "<br>" if note[draft.source_field] else ""
@@ -258,9 +260,9 @@ class BreakPlan:
 
 def due_cards(col: Collection, search: str) -> tuple[DueCard, ...]:
     ids = col.find_cards(
-        f"({search}) is:review -is:suspended -is:buried -deck:filtered"
-        if search
-        else "is:review -is:suspended -is:buried -deck:filtered"
+        col.build_search_string(
+            search or "", "is:review -is:suspended -is:buried -deck:filtered"
+        )
     )
     if len(ids) > 10000:
         raise ValueError("Narrow the search to at most 10,000 review cards.")

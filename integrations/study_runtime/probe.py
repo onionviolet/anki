@@ -122,7 +122,8 @@ def scenarios():
     proposal.write_text(json.dumps(data))
     click(d, tr.weibao_import_proposal())
     assert errors and "unlock" in errors.pop().lower()
-    d._repair_fields["Back"][0].setPlainText("Stale correction")
+    d._repair_fields["Back"][0].selectAll()
+    d._repair_fields["Back"][0].insertPlainText("Stale correction")
     d._preview_repair()
     changed = col.get_note(note.id)
     changed["Back"] = "External edit"
@@ -291,7 +292,8 @@ def scenarios():
     assert before == collection_state()
     d.refresh_repairs()
     yield idle
-    d._repair_fields["Back"][0].setPlainText("Preview-only correction")
+    d._repair_fields["Back"][0].selectAll()
+    d._repair_fields["Back"][0].insertPlainText("Preview-only correction")
     d._preview_repair()
     d._preview_capture()
     d._preview_break()

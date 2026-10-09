@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aqt
-from anki.collection import Collection
+from anki.collection import Collection, OpChanges
 from anki.models import NotetypeId
 from anki.notes import NoteId
 from aqt import gui_hooks
@@ -146,6 +146,7 @@ class StudyDialog(QDialog):
         qconnect(buttons.rejected, self.close)
         layout.addWidget(buttons)
         qconnect(self.finished, self._finish)
+        gui_hooks.operation_did_execute.append(self._operation_did_execute)
         self.refresh_overview()
         self.refresh_repairs()
         self._query(self._capture_setup, self._load_setup, "setup")
@@ -201,11 +202,11 @@ class StudyDialog(QDialog):
             if not self._closed and self._versions.get(key) == version:
                 showWarning(str(error), parent=self)
 
-        QueryOp(parent=self, op=op, success=ready).failure(
+        QueryOp(parent=self.mw, op=op, success=ready).failure(
             failed
         ).with_progress().run_in_background()
 
-    def _mutate(self, op: Callable[[Collection], Any]) -> None:
+    def _mutate(self, op: Callable[[Collection], Any], key: str) -> None:
         if self._busy:
             return
         self._busy = True
@@ -217,10 +218,10 @@ class StudyDialog(QDialog):
                 return
             self.tabs.setEnabled(True)
             self.status.setText(tr.weibao_saved())
-            for key in ("repair", "capture", "break"):
-                self._invalidate(key)
+            self._invalidate(key)
             self.refresh_overview()
-            self.refresh_repairs()
+            if key == "repair":
+                self.refresh_repairs()
 
         def failed(error: Exception) -> None:
             self._busy = False
@@ -228,7 +229,15 @@ class StudyDialog(QDialog):
                 self.tabs.setEnabled(True)
                 showWarning(str(error), parent=self)
 
-        CollectionOp(self, op).success(finished).failure(failed).run_in_background()
+        CollectionOp(self.mw, op).success(finished).failure(failed).run_in_background(
+            initiator=self
+        )
+
+    def _operation_did_execute(
+        self, changes: OpChanges, handler: object | None
+    ) -> None:
+        if not self._closed and handler is not self:
+            self.refresh_overview()
 
     def _overview_tab(self) -> None:
         layout = self._tab(tr.weibao_overview(), tr.weibao_overview_help())
@@ -364,7 +373,12 @@ class StudyDialog(QDialog):
         if self._snapshot is None:
             return
         fields = tuple(
-            (field, edit.toPlainText())
+            (
+                field,
+                edit.toPlainText()
+                if edit.document().isModified()
+                else dict(self._snapshot.fields)[field],
+            )
             for field, (edit, _lock) in self._repair_fields.items()
         )
         protected = frozenset(
@@ -391,7 +405,7 @@ class StudyDialog(QDialog):
 
     def _accept_repair(self) -> None:
         if proposal := self._proposal:
-            self._mutate(lambda col: apply_repair(col, proposal))
+            self._mutate(lambda col: apply_repair(col, proposal), "repair")
 
     def _export_repair(self) -> None:
         if self._snapshot is None:
@@ -427,7 +441,9 @@ class StudyDialog(QDialog):
             showWarning(str(error), parent=self)
             return
         for field, value in fields:
-            self._repair_fields[field][0].setPlainText(value)
+            edit = self._repair_fields[field][0]
+            edit.setPlainText(value)
+            edit.document().setModified(value != dict(self._snapshot.fields)[field])
         self._preview_repair()
 
     def _capture_tab(self) -> None:
@@ -612,7 +628,7 @@ class StudyDialog(QDialog):
 
     def _accept_capture(self) -> None:
         if draft := self._draft:
-            self._mutate(lambda col: add_capture(col, draft))
+            self._mutate(lambda col: add_capture(col, draft), "capture")
 
     def _break_tab(self) -> None:
         layout = self._tab(tr.weibao_break(), tr.weibao_break_help())
@@ -678,7 +694,7 @@ class StudyDialog(QDialog):
 
     def _accept_break(self) -> None:
         if plan := self._plan:
-            self._mutate(lambda col: apply_break(col, plan))
+            self._mutate(lambda col: apply_break(col, plan), "break")
 
     def _retention_tab(self) -> None:
         layout = self._tab(tr.weibao_retention(), tr.weibao_retention_help())
@@ -755,6 +771,7 @@ class StudyDialog(QDialog):
 
     def _finish(self, _result: int) -> None:
         self._closed = True
+        gui_hooks.operation_did_execute.remove(self._operation_did_execute)
         self.mw.pm.profile["weibao_study_columns"] = (
             self.overview.horizontalHeader().saveState().toHex().data().decode()
         )

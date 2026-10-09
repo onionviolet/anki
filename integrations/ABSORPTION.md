@@ -22,7 +22,7 @@ Use only an isolated collection for verification. Exercise note repair/protectio
 
 ## Verified implementation
 
-`just check` passed with the existing fork-author `CONTRIBUTORS_BYPASS_EMAILS` exception and `NEXTEST_TEST_THREADS=4`. Latest suite results: 184 pylib tests, 150 Qt tests, 764 Rust tests, and 70 TypeScript tests, plus formatting, typing and lint checks. The default parallel run intermittently failed the existing HTTP-success test's 10 ms timeout; the bounded run passed all Rust tests. The earlier Qt run exposed a test-owned MPV lifecycle leak. `test_mpvmanager_can_play_generated_wav` now waits for its real completion callback and shuts the manager down before restoring the test main window; the subsequent Python/Qt run passed without that callback warning.
+`just check` passed with the existing fork-author `CONTRIBUTORS_BYPASS_EMAILS` exception and `NEXTEST_TEST_THREADS=4`. Historical September 30 suite results: 184 pylib tests, 150 Qt tests, 764 Rust tests, and 70 TypeScript tests, plus formatting, typing and lint checks. The default parallel run intermittently failed the existing HTTP-success test's 10 ms timeout; the bounded run passed all Rust tests. The earlier Qt run exposed a test-owned MPV lifecycle leak. `test_mpvmanager_can_play_generated_wav` now waits for its real completion callback and shuts the manager down before restoring the test main window; the subsequent Python/Qt run passed without that callback warning.
 
 New checks cover proposal snapshot/protection validation, escaped diffs, repair undo and unchanged scheduling, stale writes, capture duplicates/source/audio changes/cloze validity, canonical media filenames, break balancing/exclusions/stale state/undo, and read-only retention comparison. Native-widget tests verify preview invalidation and render all five tabs using a synthetic collection; their background-query boundary is replaced for deterministic execution. All five screenshots were visually reviewed, including populated previews and numeric comparison results.
 
@@ -100,7 +100,7 @@ The earlier compatibility review used [JSchoreels/anki at a4f1f7b](https://githu
 
 Daily collection migration and cross-client acceptance remain separate work. The simulator helper computes missing metadata only on local copies, preserving stored cards and Undo during comparison.
 
-## Final source and packaging gate
+## Historical source and packaging gate, September 30, 2026
 
 The post-fix `just test-py` run passed 150 Qt tests (including the corrected MPV completion/cleanup test); pylib's existing 184-test result was reused by the build. `just check` passed with the same fork-author exception and `NEXTEST_TEST_THREADS=4`. This final check was incremental: unchanged Rust/TypeScript/test targets reused the already-passing build stamps; the new full-app runtime probe supplies the changed-layout and real-operation evidence. `just study-tools-check` formatted and linted the standalone tooling. `git diff --check` passed.
 
@@ -110,3 +110,11 @@ The post-fix `just test-py` run passed 150 Qt tests (including the corrected MPV
 - `anki`: `33cb02f3c16de76dcf9a24bfa0526cbe89e4aef36564f2f55d9f04cc727338ad`
 
 All work remains uncommitted. No daily app, profile, collection, browser integration setting, provider credential or production scheduler was changed during this continuation. Installed-app validation and human acceptance are not inferred from these gates.
+
+## Integration gate, October 9, 2026
+
+Phase 1 integrates origin PR #1 and retains the official AnkiConnect version, Chinese Support packaging and study tools. The simulator uses a shared non-persisting memory-state helper. Retention requests select the preset's FSRS parameter version explicitly by parameter length and include dynamic-retention settings; empty presets use the corresponding backend defaults.
+
+Phase 2 preserves untouched repair text in the editor proposal, including NBSP, CRLF and U+2028. Saved-note regression checks cover NBSP and U+2028; Anki's existing backend sanitization strips carriage returns on note writes. Capture preserves literal quotes while escaping HTML text. Break searches use backend grouping and reject acceptance after day rollover. Breaks starting today include overdue cards; retention comparison uses only the selected deck, excluding subdecks. Background progress belongs to the main window, operation completion refreshes the affected tab and Overview, and external Undo refreshes Overview without discarding Repairs edits. TTS subclass voice-regex overrides work.
+
+The required `just check` gate passed: 1,112 Rust tests (11 skipped), 200 pylib tests, 795 Qt tests (6 skipped), 175 TypeScript tests, and 84 tooling tests. Phase 2 reran changed Qt tests and checks; unchanged targets reused Phase 1 passing stamps. `just study-tools-check` passed for the updated synthetic runtime probe. Current integration runtime, wheel packaging, installed-app and human acceptance remain separate gates.

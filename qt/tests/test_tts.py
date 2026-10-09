@@ -88,3 +88,15 @@ def test_mac_tts_does_not_substitute_another_region_when_language_is_missing(
         MacTTSPlayer(MagicMock()).voice_for_tag(TTSTag("你好", "zh_CN", [], 1.0, []))
         is None
     )
+
+
+def test_mac_tts_honors_subclass_voice_regex() -> None:
+    import re
+
+    class CustomPlayer(MacTTSPlayer):
+        VOICE_HELP_LINE_RE = re.compile(r"^([^|]+)\|([^|]+)$")
+
+    voice = CustomPlayer(MagicMock())._parse_voice_line("Custom Voice|zh_CN")
+    assert voice is not None
+    assert voice.original_name == "Custom Voice"
+    assert voice.lang == "zh_CN"

@@ -41,7 +41,7 @@ import anki.template
 import aqt
 from anki import hooks
 from anki.collection import TtsVoice as BackendVoice
-from anki.mac_speech import VOICE_LINE_RE, parse_voice_line, voice_preference
+from anki.mac_speech import VOICE_LINE_RE, voice_preference
 from anki.sound import AVTag, TTSTag
 from anki.utils import checksum, is_win, tmpdir
 from aqt import gui_hooks
@@ -215,16 +215,18 @@ class MacTTSPlayer(TTSProcessPlayer):
         # fallback order changes, so {{tts zh_CN:Field}} uses Tingting when
         # installed instead of whichever novelty voice is listed first.
         voices.sort(key=lambda voice: voice_preference(voice.original_name, voice.lang))
-        return [voice for voice in voices]
+        return cast(list[TTSVoice], voices)
 
     def _parse_voice_line(self, line: str) -> MacVoice | None:
-        voice = parse_voice_line(line)
-        if not voice:
+        match = self.VOICE_HELP_LINE_RE.match(line)
+        if not match:
             return None
 
-        original_name = voice.name
+        original_name = match.group(1).strip()
         tidy_name = f"Apple_{original_name.replace(' ', '_')}"
-        return MacVoice(name=tidy_name, original_name=original_name, lang=voice.lang)
+        return MacVoice(
+            name=tidy_name, original_name=original_name, lang=match.group(2)
+        )
 
 
 class MacTTSFilePlayer(MacTTSPlayer):

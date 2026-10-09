@@ -390,3 +390,47 @@ def test_overview_counts_due_and_repair_cards_without_mutation(col: Collection) 
     assert summary.repairs == 1
     assert summary.minutes == pytest.approx(10 / 60)
     assert NoteSnapshot.read(col.get_note(note.id)) == before
+
+
+def test_capture_preserves_quotes_in_text_and_source(col: Collection) -> None:
+    draft = draft_for(
+        col,
+        fields=(("Front", "don't <skip>"), ("Back", 'Say "hello" & learn')),
+        source_field="Back",
+        source_title='Teacher\'s "notes"',
+        source_url="https://example.org/?q=don't&lang=en",
+    )
+    note = capture_note(col, draft)
+    assert note["Front"] == "don't &lt;skip&gt;"
+    assert note["Back"] == (
+        'Say "hello" &amp; learn<br>Teacher\'s "notes"<br>'
+        "https://example.org/?q=don't&amp;lang=en"
+    )
+    add_capture(col, draft)
+    assert len(col.find_notes("don't")) == 1
+
+
+def test_break_rejects_apply_after_day_rollover(
+    col: Collection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review_note(col, "day rollover", 0)
+    plan = plan_break(col, "", 0, 2, 2)
+    before = col.db.all("select * from cards")
+    monkeypatch.setattr(type(col.sched), "today", property(lambda _: plan.today + 1))
+    with pytest.raises(ValueError, match="schedule changed"):
+        apply_break(col, plan)
+    assert col.db.all("select * from cards") == before
+
+
+def test_break_groups_user_or_search(col: Collection) -> None:
+    first = review_note(col, "first", 0)
+    second = review_note(col, "second", 0)
+    suspended = review_note(col, "suspended", 0)
+    card = suspended.cards()[0]
+    card.queue = QUEUE_TYPE_SUSPENDED
+    col.update_card(card)
+    plan = plan_break(col, "Front:first OR Front:second OR Front:suspended", 0, 2, 2)
+    assert {cid for cid, _ in plan.moves} == {
+        int(first.cards()[0].id),
+        int(second.cards()[0].id),
+    }
