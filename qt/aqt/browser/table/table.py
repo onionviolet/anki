@@ -340,9 +340,8 @@ class Table:
         assert self._view is not None
         self._view.setSortingEnabled(True)
         self._view.setModel(self._model)
-        # On every paint, QHeaderView checks if each column is fully selected
-        # by calling flags() for every row, which signficantly slows down selections,
-        # so we set an empty model to prevent that.
+        # QHeaderView otherwise checks every selected row's flags on each paint.
+        # Keep the header's selection empty while the table retains its selection.
         self._horizontal_header().setSelectionModel(
             QItemSelectionModel(self._model, self._view)
         )
@@ -557,22 +556,29 @@ class Table:
         current element if present.
         """
         selected_rows = self._model.get_item_rows(self._selected_items)
-        current_row = self._current_item and self._model.get_item_row(
-            self._current_item
+        current_row = self._current_item and self._item_row(
+            self._current_item, self._selected_items, selected_rows
         )
         return selected_rows, current_row
+
+    def _item_row(
+        self, item: ItemId, items: Sequence[ItemId], item_rows: list[int]
+    ) -> int | None:
+        """Reuse selected rows when finding the current item after a search."""
+        if item in items:
+            return self._model.get_item_row_among(item, item_rows)
+        return self._model.get_item_row(item)
 
     def _toggled_selection(self) -> tuple[list[int], int | None]:
         """Convert the items of the saved selection and current element to the new state and
         return their rows.
         """
-        selected_rows = self._model.get_item_rows(
-            self._state.get_new_items(self._selected_items)
-        )
+        new_items = self._state.get_new_items(self._selected_items)
+        selected_rows = self._model.get_item_rows(new_items)
         current_row = None
         if self._current_item:
             if new_current := self._state.get_new_items([self._current_item]):
-                current_row = self._model.get_item_row(new_current[0])
+                current_row = self._item_row(new_current[0], new_items, selected_rows)
         return selected_rows, current_row
 
     # Move
@@ -673,8 +679,9 @@ class StatusDelegate(QItemDelegate):
     def paint(
         self, painter: QPainter | None, option: QStyleOptionViewItem, index: QModelIndex
     ) -> None:
-        option.textElideMode = self._model.get_cell(index).elide_mode
-        if self._model.get_cell(index).is_rtl:
+        cell = self._model.get_cell(index)
+        option.textElideMode = cell.elide_mode
+        if cell.is_rtl:
             option.direction = Qt.LayoutDirection.RightToLeft
         if row_color := self._model.get_row(index).color:
             brush = QBrush(theme_manager.qcolor(row_color))

@@ -80,10 +80,11 @@ def prune_webengine_locales(out_dir: Path) -> None:
             pak.unlink()
 
 
-def remove_visualstudio_debug_info(out_dir: Path) -> None:
-    src_dir = get_briefcase_sources_path(out_dir)
-    (src_dir / "Anki.pdb").unlink(missing_ok=True)
-    (src_dir / "Anki.exe.metagen").unlink(missing_ok=True)
+def remove_visualstudio_debug_info(out_dir: Path, portable: bool = False) -> None:
+    src_dir = get_briefcase_sources_path(out_dir, portable=portable)
+    formal_name = PORTABLE_FORMAL_NAME if portable else "Anki"
+    (src_dir / f"{formal_name}.pdb").unlink(missing_ok=True)
+    (src_dir / f"{formal_name}.exe.metagen").unlink(missing_ok=True)
 
 
 def get_briefcase_template_path() -> Path:
@@ -371,7 +372,7 @@ def build(args: argparse.Namespace) -> None:
         env=get_briefcase_environ(),
     )
     prune_webengine_locales(output_dir)
-    remove_visualstudio_debug_info(output_dir)
+    remove_visualstudio_debug_info(output_dir, portable=portable)
     repair_macos_anki_audio_layout(output_dir, portable=portable)
     if portable:
         resources = get_briefcase_sources_path(output_dir, portable=True)

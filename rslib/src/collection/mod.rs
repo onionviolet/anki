@@ -145,9 +145,9 @@ pub struct CollectionState {
     /// True if legacy Python code has executed SQL that has modified the
     /// database, requiring modification time to be bumped.
     pub(crate) modified_by_dbproxy: bool,
-    /// The modification time at the last backup, so we don't create multiple
-    /// identical backups.
-    pub(crate) last_backup_modified: Option<TimestampMillis>,
+    /// The snapshot modification time of the last completed backup. The worker
+    /// can publish success without locking or retaining the collection itself.
+    pub(crate) last_backup_modified: Arc<Mutex<Option<TimestampMillis>>>,
     pub(crate) progress: Arc<Mutex<ProgressState>>,
 }
 
@@ -661,7 +661,16 @@ impl Collection {
         scores: HashMap<CardId, RwkvReviewQueueScoreEntry>,
     ) -> Result<()> {
         let days_elapsed = self.timing_today()?.days_elapsed;
-        self.state.card_queues = None;
+        // Retain progress through the new/review mix when there is no map to clear.
+        if !scores.is_empty()
+            || self
+                .state
+                .rwkv_retrievability_scores
+                .as_ref()
+                .is_some_and(|scores| scores.review_queue_scores.is_some())
+        {
+            self.state.card_queues = None;
+        }
         self.clear_rwkv_deck_count_scores();
         self.rwkv_retrievability_scores_mut(days_elapsed)
             .set_review_queue_scores(deck_id, scores);
@@ -748,7 +757,6 @@ impl Collection {
         Ok(Some(rwkv_review_score_eligibility(
             entry.retrievability,
             &metadata,
-            config.inner.rwkv_review_allow_same_day_review,
             config.inner.rwkv_review_min_intervening_reviews,
             config.inner.rwkv_review_min_elapsed_secs,
             entry.intervening_reviews,

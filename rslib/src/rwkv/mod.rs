@@ -5,7 +5,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::mem;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -27,6 +31,8 @@ mod bulk;
 mod collection_benchmark;
 #[cfg(target_os = "macos")]
 mod matmul;
+#[cfg(target_arch = "aarch64")]
+mod query_kernels;
 #[cfg(test)]
 mod query_math_bench;
 
@@ -451,9 +457,27 @@ pub struct RwkvInference {
     features: FeatureState,
     curves: HashMap<i64, ReviewCurve>,
     warm_up_states: ReviewStateMaps,
+    stashed_warm_up_state: Option<StashedWarmUpState>,
     state_cache_store: Option<StateCacheStoreWriter>,
     target_retention: f32,
     max_interval_days: u32,
+}
+
+/// Resident state moved aside while a temporary replay uses the runtime.
+struct StashedWarmUpState {
+    features: FeatureState,
+    curves: HashMap<i64, ReviewCurve>,
+    warm_up_states: ReviewStateMaps,
+}
+
+/// Frees a replaced resident state off the caller's thread. A full
+/// collection's state is a few hundred thousand allocations, and freeing
+/// them took about 90ms that the caller would otherwise wait for.
+fn drop_in_background<T: Send + 'static>(value: T) {
+    // If the thread can't start, the closure and `value` are dropped here.
+    let _ = std::thread::Builder::new()
+        .name("rwkv-state-drop".into())
+        .spawn(move || drop(value));
 }
 
 struct StateCacheStoreWriter {
@@ -601,9 +625,11 @@ struct RwkvWorkloadTargetConfig<'a> {
     review_model: &'a RwkvWorkloadReviewModel,
 }
 
-struct RwkvWorkloadTargetSweep {
+struct RwkvWorkloadTargetSweep<'a> {
     inputs: Vec<RwkvWorkloadSimulationInput>,
-    base_state: ReviewStateMaps,
+    base_state: &'a ReviewStateMaps,
+    /// Upper bound of the states one target can copy from `base_state`.
+    target_state_len: usize,
     target_drs: Vec<u32>,
     days_to_simulate: i64,
     review_limit: usize,
@@ -625,6 +651,7 @@ impl RwkvInference {
             features: FeatureState::default(),
             curves: HashMap::new(),
             warm_up_states: ReviewStateMaps::default(),
+            stashed_warm_up_state: None,
             state_cache_store: None,
             target_retention,
             max_interval_days,
@@ -804,17 +831,18 @@ impl RwkvInference {
             ));
         };
         let mut worker = self.worker_from_cache_state(runtime_state)?;
-        let mut state_maps = ReviewStateMaps::from_serialized(
+        let state_maps = ReviewStateMaps::from_serialized(
             &snapshot.card_states,
             &snapshot.note_states,
             &snapshot.deck_states,
             &snapshot.preset_states,
             snapshot.global_state.as_deref(),
         )?;
-        worker.apply_simulation_answer(&answer, &mut state_maps)?;
+        let mut states = SimulationStates::new(&state_maps);
+        worker.apply_simulation_answer(&answer, &mut states)?;
 
         Ok(worker
-            .workload_query_predictions_for_inputs(&query_inputs, &state_maps)
+            .workload_query_predictions_for_inputs(&query_inputs, &states)
             .into_iter()
             .map(|prediction| prediction.retrievability)
             .collect())
@@ -1274,6 +1302,38 @@ insert into segments (
             .restore_serialized(card_id, note_id, deck_id, preset_id, &state)
     }
 
+    /// Moves the resident state and feature caches aside without
+    /// serializing them, leaving the runtime empty for a temporary replay.
+    /// `restore_stashed_warm_up_state()` puts them back unchanged, including
+    /// the changes that the next delta checkpoint still has to save.
+    pub fn stash_warm_up_state(&mut self) -> io::Result<()> {
+        if self.stashed_warm_up_state.is_some() {
+            return Err(io::Error::other("RWKV resident state is already stashed"));
+        }
+        self.stashed_warm_up_state = Some(StashedWarmUpState {
+            features: mem::take(&mut self.features),
+            curves: mem::take(&mut self.curves),
+            warm_up_states: mem::take(&mut self.warm_up_states),
+        });
+        Ok(())
+    }
+
+    /// Replaces the current state with the one saved by
+    /// `stash_warm_up_state()`.
+    pub fn restore_stashed_warm_up_state(&mut self) -> io::Result<()> {
+        let stashed = self
+            .stashed_warm_up_state
+            .take()
+            .ok_or_else(|| io::Error::other("no stashed RWKV resident state"))?;
+        let replaced = StashedWarmUpState {
+            features: mem::replace(&mut self.features, stashed.features),
+            curves: mem::replace(&mut self.curves, stashed.curves),
+            warm_up_states: mem::replace(&mut self.warm_up_states, stashed.warm_up_states),
+        };
+        drop_in_background(replaced);
+        Ok(())
+    }
+
     pub fn reset_warm_up_state(&mut self) {
         self.state_cache_store = None;
         self.warm_up_states = ReviewStateMaps::default();
@@ -1455,7 +1515,8 @@ insert into segments (
         };
         let base_features = read_runtime_feature_state(&runtime_state)?;
         let base_state = ReviewStateMaps::from_snapshot_for_inputs(&snapshot, &inputs)?;
-        self.simulate_workload_with_state(inputs, base_features, base_state, config, progress)
+        drop(snapshot);
+        self.simulate_workload_with_state(inputs, base_features, &base_state, config, progress)
     }
 
     /// Simulates from the resident warmed state instead of a serialized
@@ -1467,24 +1528,23 @@ insert into segments (
         progress: &mut dyn FnMut(u32, u32) -> io::Result<()>,
     ) -> io::Result<RwkvWorkloadSimulationOutput> {
         check_workload_dr_range(&config)?;
-        let base_state = self.warm_up_states.subset_for_inputs(&inputs);
         self.simulate_workload_with_state(
             inputs,
             self.features.clone(),
-            base_state,
+            &self.warm_up_states,
             config,
             progress,
         )
     }
 
-    /// `base_state` only needs the card, note, deck and preset streams of
-    /// `inputs` plus the global stream: nothing else can influence or be
-    /// advanced by the simulation.
+    /// The simulation only reads the card, note, deck and preset streams of
+    /// `inputs` plus the global stream from `base_state`, and never changes
+    /// it: each target copies a stream when it first advances it.
     fn simulate_workload_with_state(
         &self,
         inputs: Vec<RwkvWorkloadSimulationInput>,
         base_features: FeatureState,
-        base_state: ReviewStateMaps,
+        base_state: &ReviewStateMaps,
         config: RwkvWorkloadSimulationConfig,
         progress: &mut dyn FnMut(u32, u32) -> io::Result<()>,
     ) -> io::Result<RwkvWorkloadSimulationOutput> {
@@ -1494,25 +1554,28 @@ insert into segments (
         progress(0, total_steps)?;
         // Simulation workers never read recall curves, so they start without
         // copies of them.
-        let mut reviewless_worker = self.workload_worker(base_features.clone(), HashMap::new());
-        let introduced_inputs = inputs
-            .iter()
-            .filter(|input| input.review_input.card_type != Some(CardType::New as i64))
-            .cloned()
-            .collect::<Vec<_>>();
-        let (reviewless_end_memorized, reviewless_end_weighted_memorized) = reviewless_worker
-            .simulation_memorized_for_inputs(
+        let (reviewless_end_memorized, reviewless_end_weighted_memorized) = {
+            let mut reviewless_worker = self.workload_worker(base_features.clone(), HashMap::new());
+            let introduced_inputs = inputs
+                .iter()
+                .filter(|input| input.review_input.card_type != Some(CardType::New as i64))
+                .cloned()
+                .collect::<Vec<_>>();
+            reviewless_worker.simulation_memorized_for_inputs(
                 &introduced_inputs,
-                &base_state,
+                &SimulationStates::new(base_state),
                 S90_TARGET_RETENTION,
                 config.days_to_simulate as i64,
-            )?;
+            )?
+        };
         progress(1, total_steps)?;
 
+        let target_state_len = base_state.state_len_for(&StreamIds::for_workload_inputs(&inputs));
         let mut points = self.simulate_workload_targets(
             RwkvWorkloadTargetSweep {
                 inputs,
                 base_state,
+                target_state_len,
                 target_drs,
                 days_to_simulate: config.days_to_simulate as i64,
                 review_limit: config.review_limit as usize,
@@ -1539,12 +1602,13 @@ insert into segments (
 
     fn simulate_workload_targets(
         &self,
-        sweep: RwkvWorkloadTargetSweep,
+        sweep: RwkvWorkloadTargetSweep<'_>,
         progress: &mut dyn FnMut(u32, u32) -> io::Result<()>,
     ) -> io::Result<Vec<(u32, RwkvWorkloadSimulationPoint)>> {
         let RwkvWorkloadTargetSweep {
             inputs,
             base_state,
+            target_state_len,
             target_drs,
             days_to_simulate,
             review_limit,
@@ -1561,10 +1625,10 @@ insert into segments (
 
         let simulate_target = |dr: u32| {
             let mut worker = self.workload_worker(base_features.clone(), HashMap::new());
-            let mut state_maps = base_state.clone_states();
+            let mut states = SimulationStates::new(base_state);
             worker.simulate_workload_for_target(
                 &inputs,
-                &mut state_maps,
+                &mut states,
                 RwkvWorkloadTargetConfig {
                     dr,
                     days_to_simulate,
@@ -1579,24 +1643,64 @@ insert into segments (
                 },
             )
         };
-        // Every target advances its own copy of the inputs' streams. Sampled
-        // inputs make those copies small, so run several targets at once while
-        // bounding the memory of the concurrent copies.
-        let concurrent_targets = (WORKLOAD_TARGET_STATE_BUDGET_BYTES
-            / base_state.state_len().max(1))
-        .clamp(1, rayon::current_num_threads());
-        let mut results = Vec::with_capacity(target_drs.len());
-        for batch in target_drs.chunks(concurrent_targets) {
-            let points = batch
-                .par_iter()
-                .map(|dr| simulate_target(*dr))
-                .collect::<io::Result<Vec<_>>>()?;
-            for (dr, point) in batch.iter().zip(points) {
-                results.push((*dr, point));
-                progress(results.len() as u32 + 1, total_steps)?;
+        // Every target copies the streams it advances, at most all of the
+        // inputs' streams. Sampled inputs make those copies small, so run
+        // several targets at once while bounding the memory of the concurrent
+        // copies.
+        let concurrent_targets = (WORKLOAD_TARGET_STATE_BUDGET_BYTES / target_state_len.max(1))
+            .clamp(1, rayon::current_num_threads())
+            .min(target_drs.len().max(1));
+        // Higher targets review more often and take longest, so start them
+        // first, and let each worker pull the next target as soon as it is
+        // free instead of waiting for the slowest target of a fixed batch.
+        let mut queue = target_drs.iter().copied().enumerate().collect::<Vec<_>>();
+        queue.sort_by_key(|(_, dr)| std::cmp::Reverse(*dr));
+        let next_target = AtomicUsize::new(0);
+        let stopped = AtomicBool::new(false);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut points = (0..target_drs.len()).map(|_| None).collect::<Vec<_>>();
+        std::thread::scope(|scope| {
+            let (queue, next_target, stopped) = (&queue, &next_target, &stopped);
+            let simulate_target = &simulate_target;
+            scope.spawn(move || {
+                rayon::scope(|workers| {
+                    for _ in 0..concurrent_targets {
+                        let sender = sender.clone();
+                        workers.spawn(move |_| {
+                            while !stopped.load(Ordering::Relaxed) {
+                                let Some(&(index, dr)) =
+                                    queue.get(next_target.fetch_add(1, Ordering::Relaxed))
+                                else {
+                                    break;
+                                };
+                                let result = simulate_target(dr);
+                                if sender.send((index, result)).is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+            let mut completed = 0;
+            for (index, result) in receiver {
+                let step = result.and_then(|point| {
+                    points[index] = Some(point);
+                    completed += 1;
+                    progress(completed + 1, total_steps)
+                });
+                if let Err(err) = step {
+                    stopped.store(true, Ordering::Relaxed);
+                    return Err(err);
+                }
             }
-        }
-        Ok(results)
+            Ok(())
+        })?;
+        Ok(target_drs
+            .into_iter()
+            .zip(points)
+            .map(|(dr, point)| (dr, point.expect("every workload target completed")))
+            .collect())
     }
 
     fn workload_worker(
@@ -1609,6 +1713,7 @@ insert into segments (
             features,
             curves,
             warm_up_states: ReviewStateMaps::default(),
+            stashed_warm_up_state: None,
             state_cache_store: None,
             target_retention: self.target_retention,
             max_interval_days: self.max_interval_days,
@@ -1618,7 +1723,7 @@ insert into segments (
     fn simulate_workload_for_target(
         &mut self,
         inputs: &[RwkvWorkloadSimulationInput],
-        state_maps: &mut ReviewStateMaps,
+        states: &mut SimulationStates<'_>,
         config: RwkvWorkloadTargetConfig<'_>,
     ) -> io::Result<RwkvWorkloadSimulationPoint> {
         let target_retention = config.dr as f32 / 100.0;
@@ -1626,7 +1731,7 @@ insert into segments (
             .iter()
             .map(|input| simulation_query_input(input, target_retention, 0))
             .collect();
-        let predictions = self.workload_query_predictions_for_inputs(&query_inputs, state_maps);
+        let predictions = self.workload_query_predictions_for_inputs(&query_inputs, states);
         let mut cards = inputs
             .iter()
             .zip(predictions.iter())
@@ -1648,7 +1753,7 @@ insert into segments (
                 .map(|index| simulation_query_input_for_card(&cards[*index], target_retention, day))
                 .collect::<Vec<_>>();
             let order_predictions =
-                self.workload_query_predictions_for_inputs(&order_inputs, state_maps);
+                self.workload_query_predictions_for_inputs(&order_inputs, states);
             let prediction_by_index = due_review_indexes
                 .iter()
                 .copied()
@@ -1697,8 +1802,7 @@ insert into segments (
                         simulation_query_input_for_card(&cards[*index], target_retention, day)
                     })
                     .collect::<Vec<_>>();
-                let predictions =
-                    self.workload_query_predictions_for_inputs(&query_inputs, state_maps);
+                let predictions = self.workload_query_predictions_for_inputs(&query_inputs, states);
                 let eases = chunk_indexes
                     .iter()
                     .zip(&predictions)
@@ -1717,7 +1821,7 @@ insert into segments (
                     })
                     .collect::<Vec<_>>();
                 let intervals =
-                    self.selected_answer_intervals_for_inputs(&query_inputs, state_maps, &eases);
+                    self.selected_answer_intervals_for_inputs(&query_inputs, states, &eases);
 
                 for ((position, index), ease) in chunk_indexes.iter().enumerate().zip(&eases) {
                     let grade_seconds = config.review_model.grade_seconds[(*ease - 1) as usize];
@@ -1736,7 +1840,7 @@ insert into segments (
                         .unwrap_or(1)
                         .clamp(1, config.max_interval);
                     if review_count % config.state_update_interval == 0 {
-                        self.apply_simulation_answer(&answer_input, state_maps)?;
+                        self.apply_simulation_answer(&answer_input, states)?;
                     }
 
                     cards[*index].last_review_day = day;
@@ -1764,7 +1868,7 @@ insert into segments (
 
         let (memorized, weighted_memorized) = self.simulation_memorized_for_cards(
             &cards,
-            state_maps,
+            states,
             target_retention,
             config.days_to_simulate,
         )?;
@@ -1779,34 +1883,32 @@ insert into segments (
     fn workload_query_predictions_for_inputs(
         &mut self,
         inputs: &[ReviewInput],
-        state_maps: &ReviewStateMaps,
+        states: &SimulationStates<'_>,
     ) -> Vec<RwkvWorkloadQueryPrediction> {
         let work_items = inputs
             .iter()
             .map(|input| ReviewPredictionBorrowedWorkItem {
                 features: self.features.features_for(input),
-                state: state_maps.state_ref(input),
+                state: states.state_ref(input),
             })
             .collect::<Vec<_>>();
-        self.model
-            .review_many_borrowed(&work_items)
-            .into_iter()
-            .zip(inputs)
-            .map(|(heads, input)| {
-                let (current_interval, current_s90) = self.current_intervals(input, &heads);
+        let this = &*self;
+        this.model
+            .review_many_borrowed(&work_items, |index, heads| {
+                let (current_interval, current_s90) =
+                    this.current_intervals(&inputs[index], &heads);
                 RwkvWorkloadQueryPrediction {
                     retrievability: heads.retrievability,
                     current_interval,
                     current_s90,
                 }
             })
-            .collect()
     }
 
     fn selected_answer_intervals_for_inputs(
         &mut self,
         inputs: &[ReviewInput],
-        state_maps: &ReviewStateMaps,
+        states: &SimulationStates<'_>,
         eases: &[u8],
     ) -> Vec<Option<u32>> {
         debug_assert_eq!(inputs.len(), eases.len());
@@ -1819,37 +1921,34 @@ insert into segments (
             .iter()
             .map(|input| ReviewPredictionBorrowedWorkItem {
                 features: self.features.features_for(input),
-                state: state_maps.state_ref(input),
+                state: states.state_ref(input),
             })
             .collect::<Vec<_>>();
+        let (default_retention, max_interval_days) =
+            (self.target_retention, self.max_interval_days);
         self.model
-            .review_many_borrowed(&work_items)
-            .into_iter()
-            .zip(inputs.iter().zip(eases))
-            .map(|(heads, (input, ease))| {
-                let target_retention =
-                    input.target_retentions[(*ease - 1) as usize].unwrap_or(self.target_retention);
-                interval_for_curve(&heads.curve, target_retention, self.max_interval_days)
+            .review_many_borrowed(&work_items, |index, heads| {
+                let target_retention = inputs[index].target_retentions[(eases[index] - 1) as usize]
+                    .unwrap_or(default_retention);
+                interval_for_curve(&heads.curve, target_retention, max_interval_days)
             })
-            .collect()
     }
 
     fn apply_simulation_answer(
         &mut self,
         input: &ReviewInput,
-        state_maps: &mut ReviewStateMaps,
+        states: &mut SimulationStates<'_>,
     ) -> io::Result<()> {
-        let heads = self.review_heads_for_state(input, state_maps.state_ref(input))?;
+        let heads = self.review_heads_for_state(input, states.state_ref(input))?;
         self.features.store_review(input);
-        self.curves.insert(input.card_id, heads.curve.clone());
-        state_maps.store(input, heads.next_state);
+        states.store(input, heads.next_state);
         Ok(())
     }
 
     fn simulation_memorized_for_inputs(
         &mut self,
         inputs: &[RwkvWorkloadSimulationInput],
-        state_maps: &ReviewStateMaps,
+        states: &SimulationStates<'_>,
         target_retention: f32,
         day: i64,
     ) -> io::Result<(f32, f32)> {
@@ -1857,14 +1956,14 @@ insert into segments (
             .iter()
             .map(|input| simulation_query_input(input, target_retention, day))
             .collect::<Vec<_>>();
-        let predictions = self.workload_query_predictions_for_inputs(&query_inputs, state_maps);
+        let predictions = self.workload_query_predictions_for_inputs(&query_inputs, states);
         Ok(memorized_from_workload_predictions(&predictions))
     }
 
     fn simulation_memorized_for_cards(
         &mut self,
         cards: &[RwkvSimulationCard],
-        state_maps: &ReviewStateMaps,
+        states: &SimulationStates<'_>,
         target_retention: f32,
         day: i64,
     ) -> io::Result<(f32, f32)> {
@@ -1873,7 +1972,7 @@ insert into segments (
             .filter(|card| !card.is_new)
             .map(|card| simulation_query_input_for_card(card, target_retention, day))
             .collect::<Vec<_>>();
-        let predictions = self.workload_query_predictions_for_inputs(&query_inputs, state_maps);
+        let predictions = self.workload_query_predictions_for_inputs(&query_inputs, states);
         Ok(memorized_from_workload_predictions(&predictions))
     }
 }
@@ -3151,13 +3250,17 @@ impl SrsModel {
             .collect()
     }
 
-    fn review_many_borrowed(
+    /// Maps each item's heads as soon as they are computed: a batch of full
+    /// heads would hold a next state per item, hundreds of KB each.
+    fn review_many_borrowed<T: Send>(
         &self,
         items: &[ReviewPredictionBorrowedWorkItem<'_>],
-    ) -> Vec<ReviewHeads> {
+        map: impl Fn(usize, ReviewHeads) -> T + Sync,
+    ) -> Vec<T> {
         items
             .par_iter()
-            .map(|item| self.review_features(&item.features, item.state))
+            .enumerate()
+            .map(|(index, item)| map(index, self.review_features(&item.features, item.state)))
             .collect()
     }
 
@@ -3249,7 +3352,7 @@ impl SrsModel {
 
         self.features_0
             .apply_batch(&scratch.feature_input, rows, &mut scratch.feature_hidden);
-        silu_in_place(&mut scratch.feature_hidden);
+        query_silu_batch_in_place(&mut scratch.feature_hidden);
         self.features_norm.apply_batch(
             &scratch.feature_hidden,
             rows,
@@ -3257,7 +3360,7 @@ impl SrsModel {
         );
         self.features_3
             .apply_batch(&scratch.normalized_features, rows, &mut scratch.x);
-        silu_in_place(&mut scratch.x);
+        query_silu_batch_in_place(&mut scratch.x);
 
         for (module_id, module) in self.modules.iter().enumerate() {
             module.run_query_batch(&mut scratch.x, items, module_id, &mut scratch.module);
@@ -3578,21 +3681,23 @@ impl ReviewStateMaps {
         })
     }
 
-    /// Copies the states that `inputs` can read or advance, plus the global
-    /// state.
-    fn subset_for_inputs(&self, inputs: &[RwkvWorkloadSimulationInput]) -> Self {
-        let ids = StreamIds::for_workload_inputs(inputs);
-        Self {
-            card: cloned_state_map_subset(&self.card, &ids.card),
-            note: cloned_state_map_subset(&self.note, &ids.note),
-            deck: cloned_state_map_subset(&self.deck, &ids.deck),
-            preset: cloned_state_map_subset(&self.preset, &ids.preset),
-            global: self.global.clone(),
-            ..Default::default()
-        }
+    /// Approximate memory used by the states of `ids`, plus the global state.
+    fn state_len_for(&self, ids: &StreamIds) -> usize {
+        [
+            (&self.card, &ids.card),
+            (&self.note, &ids.note),
+            (&self.deck, &ids.deck),
+            (&self.preset, &ids.preset),
+        ]
+        .into_iter()
+        .flat_map(|(states, ids)| ids.iter().filter_map(|id| states.get(id)))
+        .chain(&self.global)
+        .map(serialized_module_state_len)
+        .sum()
     }
 
     /// Copies the states without their checkpoint dirty-tracking.
+    #[cfg(test)]
     fn clone_states(&self) -> Self {
         Self {
             card: self.card.clone(),
@@ -3602,16 +3707,6 @@ impl ReviewStateMaps {
             global: self.global.clone(),
             ..Default::default()
         }
-    }
-
-    /// Approximate memory used by the states.
-    fn state_len(&self) -> usize {
-        [&self.card, &self.note, &self.deck, &self.preset]
-            .into_iter()
-            .flat_map(HashMap::values)
-            .chain(&self.global)
-            .map(serialized_module_state_len)
-            .sum()
     }
 
     fn state_ref(&self, input: &ReviewInput) -> SrsStateRef<'_> {
@@ -3906,6 +4001,68 @@ impl StreamIds {
     }
 }
 
+/// The review states a simulation sees: `base` until the simulation advances
+/// a stream, then its own copy of that stream. A simulation therefore holds
+/// only the streams it advanced, and never changes `base`.
+struct SimulationStates<'a> {
+    base: &'a ReviewStateMaps,
+    card: HashMap<i64, ModuleState>,
+    note: HashMap<i64, ModuleState>,
+    deck: HashMap<i64, ModuleState>,
+    preset: HashMap<i64, ModuleState>,
+    global: Option<ModuleState>,
+}
+
+impl<'a> SimulationStates<'a> {
+    fn new(base: &'a ReviewStateMaps) -> Self {
+        Self {
+            base,
+            card: HashMap::new(),
+            note: HashMap::new(),
+            deck: HashMap::new(),
+            preset: HashMap::new(),
+            global: None,
+        }
+    }
+
+    fn state_ref(&self, input: &ReviewInput) -> SrsStateRef<'_> {
+        fn lookup<'s>(
+            own: &'s HashMap<i64, ModuleState>,
+            base: &'s HashMap<i64, ModuleState>,
+            id: i64,
+        ) -> Option<&'s ModuleState> {
+            own.get(&id).or_else(|| base.get(&id))
+        }
+        SrsStateRef {
+            card: lookup(&self.card, &self.base.card, input.card_id),
+            note: input
+                .note_id
+                .and_then(|id| lookup(&self.note, &self.base.note, id)),
+            deck: input
+                .deck_id
+                .and_then(|id| lookup(&self.deck, &self.base.deck, id)),
+            preset: input
+                .preset_id
+                .and_then(|id| lookup(&self.preset, &self.base.preset, id)),
+            global: self.global.as_ref().or(self.base.global.as_ref()),
+        }
+    }
+
+    fn store(&mut self, input: &ReviewInput, state: SrsState) {
+        self.card.insert(input.card_id, state.card);
+        if let Some(note_id) = input.note_id {
+            self.note.insert(note_id, state.note);
+        }
+        if let Some(deck_id) = input.deck_id {
+            self.deck.insert(deck_id, state.deck);
+        }
+        if let Some(preset_id) = input.preset_id {
+            self.preset.insert(preset_id, state.preset);
+        }
+        self.global = Some(state.global);
+    }
+}
+
 fn deserialize_state_map_subset(
     states: &[(i64, Vec<u8>)],
     ids: &HashSet<i64>,
@@ -3920,15 +4077,6 @@ fn deserialize_state_map_subset(
         }
     }
     Ok(map)
-}
-
-fn cloned_state_map_subset(
-    states: &HashMap<i64, ModuleState>,
-    ids: &HashSet<i64>,
-) -> HashMap<i64, ModuleState> {
-    ids.iter()
-        .filter_map(|id| Some((*id, states.get(id)?.clone())))
-        .collect()
 }
 
 fn deserialize_state_map(states: &[(i64, Vec<u8>)]) -> io::Result<HashMap<i64, ModuleState>> {
@@ -5682,22 +5830,17 @@ impl TimeMixer {
         debug_assert_eq!(v0.len(), rows * D_MODEL);
 
         self.layer_norm.apply_batch(input, rows, &mut scratch.x);
-        for (mix_id, mixed) in scratch.mixed.iter_mut().enumerate() {
+        for mixed in &mut scratch.mixed {
             mixed.resize(rows * D_MODEL, 0.0);
-            let lerp_weights = &self.rkvdag_lerp[mix_id * D_MODEL..(mix_id + 1) * D_MODEL];
-            mixed
-                .chunks_mut(D_MODEL)
-                .enumerate()
-                .for_each(|(row, mixed)| {
-                    let x = &scratch.x[row * D_MODEL..(row + 1) * D_MODEL];
-                    let x_shift = items[row]
-                        .layer_state(module_id, layer_id)
-                        .and_then(|state| state.time.as_ref())
-                        .map_or(x, |state| state.x_shift.as_slice());
-                    for channel in 0..D_MODEL {
-                        mixed[channel] = lerp(x[channel], x_shift[channel], lerp_weights[channel]);
-                    }
-                });
+        }
+        // Resolve each row's shift state once for all eight mixes.
+        for (row, item) in items.iter().enumerate() {
+            let x = &scratch.x[row * D_MODEL..(row + 1) * D_MODEL];
+            let x_shift = item
+                .layer_state(module_id, layer_id)
+                .and_then(|state| state.time.as_ref())
+                .map_or(x, |state| state.x_shift.as_slice());
+            time_shift_mix_row(x, x_shift, &self.rkvdag_lerp, &mut scratch.mixed, row);
         }
 
         self.w_r
@@ -5706,10 +5849,10 @@ impl TimeMixer {
             .apply_batch(&scratch.mixed[1], rows, &mut scratch.k);
         self.k_scale_linear
             .apply_batch(&scratch.mixed[6], rows, &mut scratch.k_scale);
-        sigmoid_in_place(&mut scratch.k_scale);
+        query_sigmoid_batch_in_place(&mut scratch.k_scale);
         self.v_scale_linear
             .apply_batch(&scratch.mixed[7], rows, &mut scratch.v_scale);
-        sigmoid_in_place(&mut scratch.v_scale);
+        query_sigmoid_batch_in_place(&mut scratch.v_scale);
 
         if self.layer_id == 0 {
             self.w_v
@@ -5745,7 +5888,7 @@ impl TimeMixer {
         );
         self.lora_a_g
             .apply_batch(&scratch.mixed[5], rows, &mut scratch.lora_hidden);
-        sigmoid_in_place(&mut scratch.lora_hidden);
+        query_sigmoid_batch_in_place(&mut scratch.lora_hidden);
         self.lora_b_g
             .apply_batch(&scratch.lora_hidden, rows, &mut scratch.g);
 
@@ -5755,28 +5898,18 @@ impl TimeMixer {
             &mut scratch.lora_hidden,
             &mut scratch.w,
         );
-        scratch.w.iter_mut().for_each(|value| {
-            *value = query_decay(*value);
-        });
+        query_decay_batch_in_place(&mut scratch.w);
 
         scratch
             .k
             .chunks_mut(D_MODEL)
-            .enumerate()
-            .for_each(|(row, k)| {
-                normalize_heads_in_place(k);
-                let scales = &scratch.k_scale[row * HEADS..(row + 1) * HEADS];
-                scale_heads_in_place(k, scales);
-            });
+            .zip(scratch.k_scale.chunks(HEADS))
+            .for_each(|(k, scales)| normalize_scale_heads_in_place(k, scales));
         scratch
             .v
             .chunks_mut(D_MODEL)
-            .enumerate()
-            .for_each(|(row, v)| {
-                normalize_heads_in_place(v);
-                let scales = &scratch.v_scale[row * HEADS..(row + 1) * HEADS];
-                scale_heads_in_place(v, scales);
-            });
+            .zip(scratch.v_scale.chunks(HEADS))
+            .for_each(|(v, scales)| normalize_scale_heads_in_place(v, scales));
 
         scratch.k_deformed.resize(rows * D_MODEL, 0.0);
         scratch.k_deformed.copy_from_slice(&scratch.k);
@@ -5816,22 +5949,15 @@ impl TimeMixer {
             .chunks_mut(D_MODEL)
             .enumerate()
             .for_each(|(row, output)| {
-                let base = row * D_MODEL;
-                for head in 0..HEADS {
-                    let head_base = head * HEAD_SIZE;
-                    let mut bonus_scale = 0.0;
-                    for index in 0..HEAD_SIZE {
-                        let channel = base + head_base + index;
-                        bonus_scale +=
-                            scratch.r[channel] * self.bonus[head_base + index] * scratch.k[channel];
-                    }
-                    for index in 0..HEAD_SIZE {
-                        let local_channel = head_base + index;
-                        let channel = base + local_channel;
-                        output[local_channel] = scratch.g[channel]
-                            * (output[local_channel] + bonus_scale * scratch.v[channel]);
-                    }
-                }
+                let range = row * D_MODEL..(row + 1) * D_MODEL;
+                bonus_gate_in_place(
+                    output,
+                    &scratch.r[range.clone()],
+                    &self.bonus,
+                    &scratch.k[range.clone()],
+                    &scratch.v[range.clone()],
+                    &scratch.g[range],
+                );
             });
 
         self.w_o.apply_batch(&scratch.temp, rows, out);
@@ -6048,7 +6174,7 @@ impl LoraSimple {
     ) {
         self.a.apply_batch(input, rows, hidden);
         self.b.apply_batch(hidden, rows, out);
-        sigmoid_in_place(out);
+        query_sigmoid_batch_in_place(out);
     }
 
     fn apply_tanh(&self, input: &[f32]) -> Vec<f32> {
@@ -6104,7 +6230,7 @@ impl LoraSimple {
         out: &mut Vec<f32>,
     ) {
         self.a.apply_batch(input, rows, hidden);
-        hidden.iter_mut().for_each(|value| *value = value.tanh());
+        query_tanh_batch_in_place(hidden);
         self.b.apply_batch(hidden, rows, out);
     }
 }
@@ -6134,6 +6260,19 @@ impl Linear {
         } else {
             out.fill(0.0);
         }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: aarch64 guarantees NEON support. The helper receives
+            // slices whose dimensions were checked above and only accesses
+            // complete weight columns and output elements within them.
+            unsafe { linear_apply_row_neon(input, &self.weight_by_input, out) };
+            #[cfg(test)]
+            rwkv_warmup_profile_record(RwkvWarmupProfileBucket::Linear, profile_started);
+            return;
+        }
+
+        #[allow(unreachable_code)]
         for (column, scale) in input.iter().copied().enumerate() {
             if scale == 0.0 {
                 continue;
@@ -6382,6 +6521,64 @@ unsafe fn add_scaled_in_place_neon(out: &mut [f32], weights: &[f32], scale: f32)
     while offset < len {
         out[offset] += weights[offset] * vgetq_lane_f32(scale, 0);
         offset += 1;
+    }
+}
+
+/// Exact single-row linear projection microkernel for AArch64 NEON machines.
+///
+/// Keeps a tile of up to 64 output accumulators in registers while walking
+/// every input column, so the output is loaded and stored once per tile
+/// instead of once per column. Each output element still starts from `out`'s
+/// initial value and accumulates ascending columns with the same fused
+/// multiply-add and zero-scale skip as `add_scaled_in_place()`, so results
+/// are bit-identical to the column-at-a-time loop.
+#[cfg(target_arch = "aarch64")]
+unsafe fn linear_apply_row_neon(input: &[f32], weights: &[f32], out: &mut [f32]) {
+    use std::arch::aarch64::*;
+
+    let output = out.len();
+    debug_assert_eq!(weights.len(), input.len() * output);
+    let out_ptr = out.as_mut_ptr();
+    let weight_ptr = weights.as_ptr();
+    let mut tile = 0;
+
+    macro_rules! tile {
+        ($lanes:literal) => {
+            while tile + 4 * $lanes <= output {
+                let mut acc = [vdupq_n_f32(0.0); $lanes];
+                for (lane, acc) in acc.iter_mut().enumerate() {
+                    *acc = vld1q_f32(out_ptr.add(tile + 4 * lane));
+                }
+                for (column, &scale) in input.iter().enumerate() {
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let scale = vdupq_n_f32(scale);
+                    let column_ptr = weight_ptr.add(column * output + tile);
+                    for (lane, acc) in acc.iter_mut().enumerate() {
+                        *acc = vfmaq_f32(*acc, vld1q_f32(column_ptr.add(4 * lane)), scale);
+                    }
+                }
+                for (lane, acc) in acc.iter().enumerate() {
+                    vst1q_f32(out_ptr.add(tile + 4 * lane), *acc);
+                }
+                tile += 4 * $lanes;
+            }
+        };
+    }
+    tile!(16);
+    tile!(4);
+    tile!(1);
+
+    for offset in tile..output {
+        let mut value = *out_ptr.add(offset);
+        for (column, &scale) in input.iter().enumerate() {
+            if scale == 0.0 {
+                continue;
+            }
+            value += *weight_ptr.add(column * output + offset) * scale;
+        }
+        *out_ptr.add(offset) = value;
     }
 }
 
@@ -7044,12 +7241,53 @@ impl Norm {
 
     #[cfg(any(target_os = "macos", test))]
     fn apply_batch(&self, input: &[f32], rows: usize, out: &mut Vec<f32>) {
-        debug_assert_eq!(input.len(), rows * self.dim);
+        assert_eq!(input.len(), rows * self.dim);
         out.resize(rows * self.dim, 0.0);
         // Accumulate independent rows together, keeping each row's reduction
         // order unchanged so SIMD does not change normalization results.
         const LANES: usize = 4;
         let group_size = self.dim / self.groups;
+
+        #[cfg(target_arch = "aarch64")]
+        if group_size % 4 == 0 && group_size * self.groups == self.dim {
+            assert!(self.weight.len() == self.dim && self.bias.len() == self.dim);
+            let mut row = 0;
+            // SAFETY: aarch64 guarantees NEON support. Each call reads and
+            // writes the `4 * BLOCKS` complete rows starting at `row`, which
+            // lie within the lengths checked above.
+            unsafe {
+                while row + 16 <= rows {
+                    query_kernels::norm_rows_neon::<4>(
+                        input.as_ptr().add(row * self.dim),
+                        out.as_mut_ptr().add(row * self.dim),
+                        self.dim,
+                        self.groups,
+                        self.eps,
+                        &self.weight,
+                        &self.bias,
+                    );
+                    row += 16;
+                }
+                while row + 4 <= rows {
+                    query_kernels::norm_rows_neon::<1>(
+                        input.as_ptr().add(row * self.dim),
+                        out.as_mut_ptr().add(row * self.dim),
+                        self.dim,
+                        self.groups,
+                        self.eps,
+                        &self.weight,
+                        &self.bias,
+                    );
+                    row += 4;
+                }
+            }
+            out[row * self.dim..]
+                .chunks_mut(self.dim)
+                .zip(input[row * self.dim..].chunks(self.dim))
+                .for_each(|(output, input)| self.apply_into(input, output));
+            return;
+        }
+
         let mut inputs = input.chunks_exact(self.dim * LANES);
         let mut outputs = out.chunks_exact_mut(self.dim * LANES);
         for (input, output) in inputs.by_ref().zip(outputs.by_ref()) {
@@ -7324,11 +7562,40 @@ fn single_timestep_query_fast_into(
     state: Option<&[f32]>,
     out: &mut [f32],
 ) {
-    debug_assert_eq!(out.len(), D_MODEL);
-    debug_assert!(
+    assert!(
+        [r, k, v, w, a, k_deformed]
+            .iter()
+            .all(|values| values.len() == D_MODEL)
+            && out.len() == D_MODEL
+    );
+    assert!(
         state.is_none() || state.is_some_and(|state| state.len() == HEADS * HEAD_SIZE * HEAD_SIZE)
     );
 
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 guarantees NEON support, and every slice length was
+    // checked above; the kernel only reads and writes within those lengths.
+    unsafe {
+        query_kernels::single_timestep_query_fast_neon(r, k, v, w, a, k_deformed, state, out);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    single_timestep_query_fast_scalar(r, k, v, w, a, k_deformed, state, out);
+}
+
+/// Portable reference for `single_timestep_query_fast_into()`.
+#[cfg(any(not(target_arch = "aarch64"), test))]
+#[allow(clippy::too_many_arguments)]
+fn single_timestep_query_fast_scalar(
+    r: &[f32],
+    k: &[f32],
+    v: &[f32],
+    w: &[f32],
+    a: &[f32],
+    k_deformed: &[f32],
+    state: Option<&[f32]>,
+    out: &mut [f32],
+) {
     for head in 0..HEADS {
         let head_base = head * HEAD_SIZE;
         let matrix_base = head * HEAD_SIZE * HEAD_SIZE;
@@ -7379,7 +7646,99 @@ fn normalize_heads_in_place(values: &mut [f32]) {
     }
 }
 
+/// Writes row `row` of all eight time-mix inputs,
+/// `mixed[mix] = lerp(x, x_shift, lerp_weights[mix])`, in one pass. Sharing
+/// `x_shift - x` between the mixes keeps `lerp()`'s exact arithmetic.
 #[cfg(any(target_os = "macos", test))]
+fn time_shift_mix_row(
+    x: &[f32],
+    x_shift: &[f32],
+    lerp_weights: &[f32],
+    mixed: &mut [Vec<f32>; 8],
+    row: usize,
+) {
+    assert!(x.len() == D_MODEL && x_shift.len() == D_MODEL);
+    assert_eq!(lerp_weights.len(), mixed.len() * D_MODEL);
+    let mut shift_delta = [0.0; D_MODEL];
+    for channel in 0..D_MODEL {
+        shift_delta[channel] = x_shift[channel] - x[channel];
+    }
+    for (mixed, weights) in mixed.iter_mut().zip(lerp_weights.chunks_exact(D_MODEL)) {
+        let mixed = &mut mixed[row * D_MODEL..(row + 1) * D_MODEL];
+        for channel in 0..D_MODEL {
+            mixed[channel] = x[channel] + weights[channel] * shift_delta[channel];
+        }
+    }
+}
+
+/// `normalize_heads_in_place()` followed by `scale_heads_in_place()`.
+#[cfg(any(target_os = "macos", test))]
+fn normalize_scale_heads_in_place(values: &mut [f32], scales: &[f32]) {
+    assert!(values.len() == D_MODEL && scales.len() == HEADS);
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 guarantees NEON support, and both lengths were checked
+    // above; the kernel only accesses elements within them.
+    unsafe {
+        query_kernels::normalize_scale_heads_neon(values, scales);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        normalize_heads_in_place(values);
+        scale_heads_in_place(values, scales);
+    }
+}
+
+/// Adds the per-head bonus to the group-normed recurrence output and applies
+/// the output gate: `output = g * (output + sum_head(r * bonus * k) * v)`.
+#[cfg(any(target_os = "macos", test))]
+fn bonus_gate_in_place(
+    output: &mut [f32],
+    r: &[f32],
+    bonus: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+) {
+    assert!([&*output, r, bonus, k, v, g]
+        .iter()
+        .all(|values| values.len() == D_MODEL));
+
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 guarantees NEON support, and every length was checked
+    // above; the kernel only accesses elements within them.
+    unsafe {
+        query_kernels::bonus_gate_neon(output, r, bonus, k, v, g);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    bonus_gate_scalar(output, r, bonus, k, v, g);
+}
+
+/// Portable reference for `bonus_gate_in_place()`.
+#[cfg(any(all(target_os = "macos", not(target_arch = "aarch64")), test))]
+fn bonus_gate_scalar(
+    output: &mut [f32],
+    r: &[f32],
+    bonus: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: &[f32],
+) {
+    for head in 0..HEADS {
+        let head_base = head * HEAD_SIZE;
+        let mut bonus_scale = 0.0;
+        for channel in head_base..head_base + HEAD_SIZE {
+            bonus_scale += r[channel] * bonus[channel] * k[channel];
+        }
+        for channel in head_base..head_base + HEAD_SIZE {
+            output[channel] = g[channel] * (output[channel] + bonus_scale * v[channel]);
+        }
+    }
+}
+
+#[cfg(any(all(target_os = "macos", not(target_arch = "aarch64")), test))]
 fn scale_heads_in_place(values: &mut [f32], scales: &[f32]) {
     debug_assert_eq!(values.len(), D_MODEL);
     debug_assert_eq!(scales.len(), HEADS);
@@ -7436,12 +7795,54 @@ fn sigmoid(value: f32) -> f32 {
     }
 }
 
+// exp(-0.5), rounded to f32.
 #[cfg(any(target_os = "macos", test))]
+const QUERY_DECAY_SCALE: f32 = 0.606_530_67;
+
+/// Scalar reference for `query_decay_batch_in_place()`.
+#[cfg(test)]
 fn query_decay(value: f32) -> f32 {
     // exp(-exp(-0.5 - softplus(-x))) = exp(-exp(-0.5) * sigmoid(x)).
     // Query-only: recurrent state updates keep their original arithmetic.
-    const SCALE: f32 = 0.606_530_67; // exp(-0.5), rounded to f32
-    (-SCALE * sigmoid(value)).exp()
+    (-QUERY_DECAY_SCALE * sigmoid(value)).exp()
+}
+
+// Batched query-only activations. On macOS they use Accelerate's vectorized
+// transcendental functions, which may differ from the scalar ones in the last
+// bit; answer rows and warm-up state updates keep the scalar functions.
+
+#[cfg(any(target_os = "macos", test))]
+fn query_sigmoid_batch_in_place(values: &mut [f32]) {
+    #[cfg(target_os = "macos")]
+    matmul::sigmoid_in_place(values);
+    #[cfg(not(target_os = "macos"))]
+    sigmoid_in_place(values);
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn query_silu_batch_in_place(values: &mut [f32]) {
+    #[cfg(target_os = "macos")]
+    matmul::silu_in_place(values);
+    #[cfg(not(target_os = "macos"))]
+    silu_in_place(values);
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn query_tanh_batch_in_place(values: &mut [f32]) {
+    #[cfg(target_os = "macos")]
+    matmul::tanh_in_place(values);
+    #[cfg(not(target_os = "macos"))]
+    values.iter_mut().for_each(|value| *value = value.tanh());
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn query_decay_batch_in_place(values: &mut [f32]) {
+    #[cfg(target_os = "macos")]
+    matmul::scaled_sigmoid_decay_in_place(values, QUERY_DECAY_SCALE);
+    #[cfg(not(target_os = "macos"))]
+    values
+        .iter_mut()
+        .for_each(|value| *value = query_decay(*value));
 }
 
 fn softplus(value: f32) -> f32 {
@@ -8084,6 +8485,43 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[test]
+    fn linear_apply_into_matches_column_loop_bit_exactly() {
+        // Output widths cover the 64-, 16- and 4-lane tiles plus a scalar tail.
+        for (input, output) in [(128, 128), (92, 512), (16, 128), (128, 4), (13, 87), (7, 3)] {
+            let linear = Linear {
+                input,
+                output,
+                weight_by_input: deterministic_simd_values(input * output, 29, -0.0078125),
+                bias: Some(deterministic_simd_values(output, 11, 0.015625)),
+            };
+            let mut values = deterministic_simd_values(input, 17, 0.03125);
+            for index in (0..values.len()).step_by(5) {
+                values[index] = 0.0;
+            }
+
+            let mut expected = linear.bias.clone().unwrap();
+            for (column, scale) in values.iter().copied().enumerate() {
+                if scale != 0.0 {
+                    add_scaled_in_place(
+                        &mut expected,
+                        &linear.weight_by_input[column * output..(column + 1) * output],
+                        scale,
+                    );
+                }
+            }
+            let actual = linear.apply(&values);
+
+            let bits = |values: &[f32]| {
+                values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&actual), bits(&expected), "{input}x{output}");
+        }
+    }
+
     fn sequential_time_mixer_state(steps: &[RwkvScanCapturedStep]) -> Vec<f32> {
         let mut state = vec![0.0; HEADS * HEAD_SIZE * HEAD_SIZE];
         for step in steps {
@@ -8558,6 +8996,134 @@ order by e.id, e.cid
             println!(
                 "single_timestep_warmup_fraction={:.6}",
                 (nanos as f64 / 1_000_000.0) / warmup_ms.max(f64::MIN_POSITIVE)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn rwkv_workload_simulation_collection_benchmark() {
+        let Ok(collection_path) = std::env::var("ANKI_RWKV_SIM_BENCH_COLLECTION") else {
+            eprintln!(
+                "set ANKI_RWKV_SIM_BENCH_COLLECTION to a copied collection.anki2 path to run this benchmark"
+            );
+            return;
+        };
+        let weights_path = std::env::var("ANKI_RWKV_SIM_BENCH_MODEL")
+            .unwrap_or_else(|_| "qt/aqt/rwkv_inference/RWKV_trained_on_5000_10000.bin".to_string());
+        let cards = scan_bench_env_usize("ANKI_RWKV_SIM_BENCH_CARDS", 250);
+        let days = scan_bench_env_usize("ANKI_RWKV_SIM_BENCH_DAYS", 365) as u32;
+        let min_dr = scan_bench_env_usize("ANKI_RWKV_SIM_BENCH_MIN_DR", 30) as u32;
+        let max_dr = scan_bench_env_usize("ANKI_RWKV_SIM_BENCH_MAX_DR", 99) as u32;
+        let dr_step = scan_bench_env_usize("ANKI_RWKV_SIM_BENCH_DR_STEP", 1) as u32;
+        let state_update_interval =
+            scan_bench_env_usize("ANKI_RWKV_SIM_BENCH_STATE_UPDATE_INTERVAL", 1) as u32;
+        let rounds = scan_bench_env_usize("ANKI_RWKV_SIM_BENCH_ROUNDS", 1);
+
+        let reviews =
+            collection_reviews_for_scan_bench(std::path::Path::new(&collection_path), 0, None)
+                .expect("collection review load failed");
+        let mut inference =
+            RwkvInference::load(std::path::PathBuf::from(weights_path), 0.9, 36_500)
+                .expect("RWKV load failed");
+        let warmup_started = std::time::Instant::now();
+        inference
+            .warm_up_reviews(reviews.clone(), false)
+            .expect("RWKV warm-up failed");
+        let warmup_ms = warmup_started.elapsed().as_secs_f64() * 1000.0;
+
+        // Query every sampled card today, from its latest historical review.
+        let today = reviews
+            .iter()
+            .filter_map(|review| review.day_offset)
+            .max()
+            .unwrap_or(0);
+        let mut latest_by_card: HashMap<i64, (&ReviewInput, i64)> = HashMap::new();
+        for review in &reviews {
+            let entry = latest_by_card.entry(review.card_id).or_insert((review, 0));
+            entry.0 = review;
+            entry.1 += 1;
+        }
+        let mut card_ids = latest_by_card.keys().copied().collect::<Vec<_>>();
+        card_ids.sort_unstable();
+        let stride = (card_ids.len() / cards.max(1)).max(1);
+        let inputs = card_ids
+            .iter()
+            .step_by(stride)
+            .take(cards)
+            .map(|card_id| {
+                let (review, reps) = latest_by_card[card_id];
+                let elapsed_days = (today - review.day_offset.unwrap_or(today)).max(0);
+                RwkvWorkloadSimulationInput {
+                    review_input: ReviewInput {
+                        is_query: true,
+                        ease: None,
+                        duration_millis: None,
+                        card_type: Some(CardType::Review as i64),
+                        day_offset: Some(today),
+                        current_elapsed_days: Some(elapsed_days),
+                        current_elapsed_seconds: Some(elapsed_days * 86_400),
+                        target_retentions: [None; 4],
+                        ..review.clone()
+                    },
+                    interval_days: Some(elapsed_days.max(1)),
+                    ease_factor: Some(2500),
+                    reps: Some(reps),
+                    lapses: Some(0),
+                }
+            })
+            .collect::<Vec<_>>();
+        let config = || RwkvWorkloadSimulationConfig {
+            min_dr,
+            max_dr,
+            target_dr_step: dr_step,
+            days_to_simulate: days,
+            review_limit: 9_999,
+            new_limit: 0,
+            new_cards_ignore_review_limit: false,
+            max_interval: 36_500,
+            review_order: ReviewCardOrder::RetrievabilityAscending,
+            suspend_after_lapses: None,
+            state_update_interval,
+            review_model: RwkvWorkloadReviewModel {
+                grade_seconds: [12.0, 9.0, 7.0, 5.0],
+                bucket_probabilities: vec![],
+            },
+        };
+
+        println!("collection_reviews={}", reviews.len());
+        println!("warmup_ms={warmup_ms:.3}");
+        println!("sim_cards={}", inputs.len());
+        println!(
+            "sim_state_bytes={}",
+            inference
+                .warm_up_states
+                .state_len_for(&StreamIds::for_workload_inputs(&inputs))
+        );
+        for round in 0..rounds {
+            let started = std::time::Instant::now();
+            let output = inference
+                .simulate_workload_from_warm_up(inputs.clone(), config(), &mut |_, _| Ok(()))
+                .expect("simulation failed");
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut hash = 0xcbf29ce484222325u64;
+            let mut mix = |value: u32| {
+                hash ^= u64::from(value);
+                hash = hash.wrapping_mul(0x100000001b3);
+            };
+            mix(output.reviewless_end_memorized.to_bits());
+            mix(output.reviewless_end_weighted_memorized.to_bits());
+            let mut reviews_total = 0u64;
+            for (dr, point) in &output.points {
+                mix(*dr);
+                mix(point.memorized.to_bits());
+                mix(point.weighted_memorized.to_bits());
+                mix(point.cost.to_bits());
+                mix(point.review_count);
+                reviews_total += u64::from(point.review_count);
+            }
+            println!(
+                "round={round} sim_ms={elapsed_ms:.1} simulated_reviews={reviews_total} output_hash={hash:016x}"
             );
         }
     }
@@ -9072,6 +9638,118 @@ order by e.id, e.cid
                 "runtime cache size diverged (record={record_predictions})"
             );
         }
+    }
+
+    #[test]
+    fn stashed_warm_up_state_restores_resident_state_and_pending_delta() {
+        let Some(weights) = embedded_weights_path() else {
+            eprintln!("skipping: embedded RWKV weights not found");
+            return;
+        };
+        let reviews = bulk_parity_reviews(40);
+        let mut inference = RwkvInference::load(weights.clone(), 0.9, 36_500).unwrap();
+        let empty_cache_state = inference.cache_state();
+        inference
+            .warm_up_reviews_sequential(reviews[..24].to_vec(), false)
+            .unwrap();
+        let cache_state = inference.cache_state();
+        let snapshot = inference.warm_up_snapshot();
+        let pending_delta_len = inference
+            .warm_up_states
+            .checkpoint_delta_len(false)
+            .unwrap();
+        assert!(!snapshot.card_states.is_empty());
+        assert!(
+            pending_delta_len
+                > ReviewStateMaps::default()
+                    .checkpoint_delta_len(false)
+                    .unwrap()
+        );
+
+        inference.stash_warm_up_state().unwrap();
+        assert!(inference.stash_warm_up_state().is_err());
+        assert_eq!(inference.cache_state(), empty_cache_state);
+        assert!(inference.warm_up_snapshot().card_states.is_empty());
+        assert!(inference.warm_up_snapshot().global_state.is_none());
+
+        inference.reset_warm_up_state();
+        inference
+            .warm_up_reviews_sequential(reviews[8..].to_vec(), true)
+            .unwrap();
+        inference.restore_stashed_warm_up_state().unwrap();
+        assert!(inference.restore_stashed_warm_up_state().is_err());
+
+        let restored = inference.warm_up_snapshot();
+        assert_eq!(inference.cache_state(), cache_state);
+        assert_eq!(restored.card_states, snapshot.card_states);
+        assert_eq!(restored.note_states, snapshot.note_states);
+        assert_eq!(restored.deck_states, snapshot.deck_states);
+        assert_eq!(restored.preset_states, snapshot.preset_states);
+        assert_eq!(restored.global_state, snapshot.global_state);
+        // Unlike a serialized snapshot restore, the stash keeps the changes
+        // that the next delta checkpoint still has to write.
+        assert_eq!(
+            inference
+                .warm_up_states
+                .checkpoint_delta_len(false)
+                .unwrap(),
+            pending_delta_len
+        );
+    }
+
+    #[test]
+    fn stash_round_trip_keeps_later_predictions_bit_identical_after_temporary_replay() {
+        let Some(weights) = embedded_weights_path() else {
+            eprintln!("skipping: embedded RWKV weights not found");
+            return;
+        };
+        let reviews = bulk_parity_reviews(120);
+        let (history, later) = reviews.split_at(60);
+        let queries = later
+            .iter()
+            .map(|review| ReviewInput {
+                is_query: true,
+                ease: None,
+                duration_millis: None,
+                ..review.clone()
+            })
+            .collect::<Vec<_>>();
+        let mut untouched = RwkvInference::load(weights.clone(), 0.9, 36_500).unwrap();
+        let mut stashed = RwkvInference::load(weights, 0.9, 36_500).unwrap();
+        untouched.warm_up_reviews(history.to_vec(), false).unwrap();
+        stashed.warm_up_reviews(history.to_vec(), false).unwrap();
+
+        stashed.stash_warm_up_state().unwrap();
+        stashed.reset_warm_up_state();
+        stashed.warm_up_reviews(reviews.clone(), true).unwrap();
+        stashed.restore_stashed_warm_up_state().unwrap();
+
+        let bits = |predictions: Vec<f32>| {
+            predictions
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(
+                stashed
+                    .predict_retrievability_many_from_warm_up(queries.clone())
+                    .unwrap()
+            ),
+            bits(
+                untouched
+                    .predict_retrievability_many_from_warm_up(queries)
+                    .unwrap()
+            ),
+        );
+        // Continuing from the restored state must match continuing from a
+        // state that was never stashed: features, curves and states included.
+        assert_prediction_parity(
+            &untouched.warm_up_reviews(later.to_vec(), true).unwrap(),
+            &stashed.warm_up_reviews(later.to_vec(), true).unwrap(),
+        );
+        assert_warm_up_parity(&untouched, &stashed);
+        assert_eq!(stashed.cache_state(), untouched.cache_state());
     }
 
     #[test]
@@ -9760,6 +10438,146 @@ order by e.id, e.cid
     }
 
     #[test]
+    fn batched_query_activations_match_scalar_functions() {
+        let values = (-200_000..=200_000)
+            .map(|i| i as f32 / 1_000.0)
+            .chain([
+                0.0,
+                -0.0,
+                1e-30,
+                -1e-30,
+                1e30,
+                -1e30,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ])
+            .collect::<Vec<_>>();
+        let check = |name: &str, batch: fn(&mut [f32]), scalar: &dyn Fn(f32) -> f32| {
+            let mut actual = values.clone();
+            batch(&mut actual);
+            for (value, actual) in values.iter().zip(&actual) {
+                let expected = scalar(*value);
+                let tolerance = (4.0 * f32::EPSILON * expected.abs()).max(1e-30);
+                assert!(
+                    (actual - expected).abs() <= tolerance
+                        || actual.to_bits() == expected.to_bits(),
+                    "{name}({value}): {actual} vs {expected}"
+                );
+            }
+        };
+        check("sigmoid", query_sigmoid_batch_in_place, &sigmoid);
+        check("silu", query_silu_batch_in_place, &|value| {
+            value * sigmoid(value)
+        });
+        check("tanh", query_tanh_batch_in_place, &f32::tanh);
+        check("decay", query_decay_batch_in_place, &query_decay);
+    }
+
+    /// Deterministic values spanning signs, zeros and several magnitudes, so
+    /// vectorized reductions cannot hide a reordering behind uniform inputs.
+    fn varied_values(len: usize, seed: u32) -> Vec<f32> {
+        (0..len)
+            .map(|index| {
+                let phase = (index as u32)
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(seed);
+                let magnitude = [1e-6, 0.03, 0.7, 5.0, 300.0][(phase >> 7) as usize % 5];
+                match phase % 29 {
+                    0 => 0.0,
+                    1 => -0.0,
+                    _ => ((phase % 997) as f32 / 498.5 - 1.0) * magnitude,
+                }
+            })
+            .collect()
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    #[test]
+    fn query_timestep_kernel_matches_scalar_bits() {
+        let [r, k, v, w, a, k_deformed] =
+            std::array::from_fn(|seed| varied_values(D_MODEL, seed as u32 + 1));
+        let w = w
+            .iter()
+            .map(|value| value.abs().min(1.0))
+            .collect::<Vec<_>>();
+        let state = varied_values(HEADS * HEAD_SIZE * HEAD_SIZE, 17);
+
+        for state in [None, Some(state.as_slice())] {
+            let mut expected = [0.0; D_MODEL];
+            single_timestep_query_fast_scalar(
+                &r,
+                &k,
+                &v,
+                &w,
+                &a,
+                &k_deformed,
+                state,
+                &mut expected,
+            );
+            let mut actual = [0.0; D_MODEL];
+            single_timestep_query_fast_into(&r, &k, &v, &w, &a, &k_deformed, state, &mut actual);
+
+            assert_eq!(bits(&actual), bits(&expected), "state: {}", state.is_some());
+        }
+    }
+
+    #[test]
+    fn fused_head_normalization_matches_separate_passes_bits() {
+        let mut zero_head = varied_values(D_MODEL, 3);
+        zero_head[HEAD_SIZE..2 * HEAD_SIZE].fill(0.0);
+        for values in [varied_values(D_MODEL, 5), zero_head] {
+            let scales = [0.25, -1.5, 1.0, 3e-3];
+            let mut expected = values.clone();
+            normalize_heads_in_place(&mut expected);
+            scale_heads_in_place(&mut expected, &scales);
+            let mut actual = values;
+            normalize_scale_heads_in_place(&mut actual, &scales);
+
+            assert_eq!(bits(&actual), bits(&expected));
+        }
+    }
+
+    #[test]
+    fn fused_time_shift_mix_matches_per_mix_lerp_bits() {
+        let lerp_weights = varied_values(8 * D_MODEL, 60);
+        let x = varied_values(D_MODEL, 61);
+        let x_shift = varied_values(D_MODEL, 62);
+        // A row without time state uses its own input as the shift.
+        for (row, x_shift) in [(0, &x_shift), (2, &x)] {
+            let mut mixed: [Vec<f32>; 8] = std::array::from_fn(|_| vec![7.0; 3 * D_MODEL]);
+            time_shift_mix_row(&x, x_shift, &lerp_weights, &mut mixed, row);
+
+            for (mix, (mixed, weights)) in
+                mixed.iter().zip(lerp_weights.chunks(D_MODEL)).enumerate()
+            {
+                let expected = (0..D_MODEL)
+                    .map(|channel| lerp(x[channel], x_shift[channel], weights[channel]))
+                    .collect::<Vec<_>>();
+                let rows = mixed.chunks(D_MODEL).collect::<Vec<_>>();
+                assert_eq!(bits(rows[row]), bits(&expected), "mix {mix} row {row}");
+                for other in (0..3).filter(|other| *other != row) {
+                    assert!(rows[other].iter().all(|value| *value == 7.0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bonus_gate_kernel_matches_scalar_bits() {
+        let [output, r, bonus, k, v, g] =
+            std::array::from_fn(|seed| varied_values(D_MODEL, seed as u32 + 40));
+        let mut expected = output.clone();
+        bonus_gate_scalar(&mut expected, &r, &bonus, &k, &v, &g);
+        let mut actual = output;
+        bonus_gate_in_place(&mut actual, &r, &bonus, &k, &v, &g);
+
+        assert_eq!(bits(&actual), bits(&expected));
+    }
+
+    #[test]
     fn batched_normalization_preserves_scalar_bits() {
         for (dim, groups) in [(16, 1), (128, 1), (128, 4), (128, 8), (256, 1), (512, 1)] {
             let norm = Norm {
@@ -9935,7 +10753,7 @@ order by e.id, e.cid
             },
         };
 
-        // Reference: every target replays on a full copy of the resident
+        // Reference: every target replays over a full copy of the resident
         // state, one target at a time.
         let full_state = inference.warm_up_states.clone_states();
         let mut reviewless_worker =
@@ -9944,7 +10762,7 @@ order by e.id, e.cid
         let (reviewless_end_memorized, reviewless_end_weighted_memorized) = reviewless_worker
             .simulation_memorized_for_inputs(
                 &introduced_inputs,
-                &full_state,
+                &SimulationStates::new(&full_state),
                 S90_TARGET_RETENTION,
                 20,
             )
@@ -9955,7 +10773,7 @@ order by e.id, e.cid
             .map(|dr| {
                 let mut worker =
                     inference.workload_worker(inference.features.clone(), inference.curves.clone());
-                let mut state = full_state.clone_states();
+                let mut state = SimulationStates::new(&full_state);
                 let point = worker
                     .simulate_workload_for_target(
                         &inputs,

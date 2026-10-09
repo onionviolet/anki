@@ -466,6 +466,73 @@ impl SqliteStorage {
         .map(|_| ())
     }
 
+    /// Deletes rows of `source` whose (revlog id, role, fold) is not in `keep`,
+    /// and every row of `superseded_sources`. A recompute only rewrites rows
+    /// whose prediction changed, so rows from earlier runs survive under roles
+    /// the latest run no longer assigns, and readers taking the newest row
+    /// could pick one of them.
+    pub(crate) fn prune_rwkv_review_retrievability_rows(
+        &self,
+        source: &str,
+        keep: &[(RevlogId, RwkvReviewRetrievabilitySampleRole, i32)],
+        superseded_sources: &[String],
+    ) -> Result<usize> {
+        // An empty run never supersedes existing calibration data.
+        if keep.is_empty() {
+            return Ok(0);
+        }
+
+        self.ensure_rwkv_review_retrievability_cache_schema()?;
+
+        self.with_retrievability_cache_write_batch(|| {
+            self.db.execute_batch(
+                "
+                CREATE TEMP TABLE IF NOT EXISTS rwkv_calibration_keep (
+                    revlog_id INTEGER NOT NULL,
+                    sample_role TEXT NOT NULL,
+                    fold_index INTEGER NOT NULL,
+                    PRIMARY KEY (revlog_id, sample_role, fold_index)
+                ) WITHOUT ROWID;
+                DELETE FROM temp.rwkv_calibration_keep;
+                ",
+            )?;
+            let mut insert = self.db.prepare_cached(
+                "INSERT OR IGNORE INTO temp.rwkv_calibration_keep VALUES (?, ?, ?)",
+            )?;
+            for (revlog_id, sample_role, fold_index) in keep {
+                insert.execute(params![revlog_id, sample_role.as_str(), fold_index])?;
+            }
+
+            let table =
+                Self::qualified_retrievability_cache_table(RWKV_REVIEW_RETRIEVABILITY_CACHE_TABLE);
+            let mut deleted = self.db.execute(
+                &format!(
+                    "
+                    DELETE FROM {table}
+                    WHERE source = ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM temp.rwkv_calibration_keep keep
+                        WHERE keep.revlog_id = {table}.revlog_id
+                          AND keep.sample_role = {table}.sample_role
+                          AND keep.fold_index = {table}.fold_index
+                      )
+                    "
+                ),
+                [source],
+            )?;
+            if !superseded_sources.is_empty() {
+                let placeholders = vec!["?"; superseded_sources.len()].join(", ");
+                deleted += self.db.execute(
+                    &format!("DELETE FROM {table} WHERE source IN ({placeholders})"),
+                    rusqlite::params_from_iter(superseded_sources),
+                )?;
+            }
+            self.db
+                .execute_batch("DROP TABLE temp.rwkv_calibration_keep;")?;
+            Ok(deleted)
+        })
+    }
+
     pub(crate) fn fix_revlog_properties(&self) -> Result<usize> {
         self.db
             .prepare(include_str!("fix_props.sql"))?
@@ -553,6 +620,36 @@ impl SqliteStorage {
         Ok(review_times)
     }
 
+    /// Counts since the most recent answer for cards still inside the repeat
+    /// spacing window. Other cards have already met the requested minimum.
+    pub(crate) fn recent_rwkv_intervening_reviews(
+        &self,
+        deck_ids: &[DeckId],
+        minimum_reviews: u32,
+    ) -> Result<HashMap<CardId, u32>> {
+        let mut counts = HashMap::new();
+        if minimum_reviews == 0 {
+            return Ok(counts);
+        }
+        let mut ids = String::new();
+        ids_to_string(&mut ids, deck_ids);
+        let sql = format!(
+            "select r.cid from revlog r join cards c on c.id = r.cid \
+             where r.ease between 1 and 4 and r.type in (0, 1, 2, 3, 4, 5) \
+             and not (r.type = 3 and r.factor = 0) \
+             and (case when c.odid != 0 then c.odid else c.did end) in {ids} \
+             order by r.id desc limit ?"
+        );
+        let mut stmt = self.db.prepare(&sql)?;
+        let mut rows = stmt.query([minimum_reviews])?;
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            counts.entry(row.get(0)?).or_insert(count);
+            count += 1;
+        }
+        Ok(counts)
+    }
+
     /// Cards with a genuine answer in the half-open timestamp range.
     pub(crate) fn card_ids_reviewed_between(
         &self,
@@ -587,9 +684,18 @@ impl SqliteStorage {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn rwkv_historical_review_rows(
         &self,
         ignored_review_ids: &[RevlogId],
+    ) -> Result<(Vec<RwkvHistoricalReviewRow>, Vec<i64>)> {
+        self.rwkv_historical_review_rows_with_cutoffs(ignored_review_ids, &HashMap::new())
+    }
+
+    pub(crate) fn rwkv_historical_review_rows_with_cutoffs(
+        &self,
+        ignored_review_ids: &[RevlogId],
+        preserved_learning_start_cutoffs: &HashMap<i64, i64>,
     ) -> Result<(Vec<RwkvHistoricalReviewRow>, Vec<i64>)> {
         let (ignored_clause, active_ignored_review_ids) = if ignored_review_ids.is_empty() {
             (String::new(), Vec::new())
@@ -652,7 +758,7 @@ order by r.id"
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        retain_rwkv_rows_from_latest_learning_start(&mut rows);
+        retain_rwkv_rows_from_latest_learning_start(&mut rows, preserved_learning_start_cutoffs);
 
         Ok((rows, active_ignored_review_ids))
     }
@@ -761,8 +867,12 @@ order by r.id"
 /// Drops each card's reviews before its latest learning start, where a
 /// learning start is a learning review not preceded by another learning
 /// review. Cards without one keep their full history. `rows` must be in
-/// review id order.
-fn retain_rwkv_rows_from_latest_learning_start(rows: &mut Vec<RwkvHistoricalReviewRow>) {
+/// review id order. A preserved cutoff prevents later learning sequences from
+/// replacing that card's replay start; those later reviews are still replayed.
+fn retain_rwkv_rows_from_latest_learning_start(
+    rows: &mut Vec<RwkvHistoricalReviewRow>,
+    preserved_learning_start_cutoffs: &HashMap<i64, i64>,
+) {
     struct CardReplayStart {
         previous_kind: i64,
         latest_learning_start: Option<i64>,
@@ -770,17 +880,21 @@ fn retain_rwkv_rows_from_latest_learning_start(rows: &mut Vec<RwkvHistoricalRevi
     }
     let mut starts: HashMap<i64, CardReplayStart> = HashMap::new();
     for row in rows.iter() {
+        let may_start_learning = row.review_kind == 0
+            && !preserved_learning_start_cutoffs
+                .get(&row.card_id)
+                .is_some_and(|cutoff| row.review_id > *cutoff);
         match starts.entry(row.card_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(CardReplayStart {
                     previous_kind: row.review_kind,
-                    latest_learning_start: (row.review_kind == 0).then_some(row.review_id),
+                    latest_learning_start: may_start_learning.then_some(row.review_id),
                     first_review_id: row.review_id,
                 });
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 let start = entry.get_mut();
-                if row.review_kind == 0 && start.previous_kind != 0 {
+                if may_start_learning && start.previous_kind != 0 {
                     start.latest_learning_start = Some(row.review_id);
                 }
                 start.previous_kind = row.review_kind;
@@ -790,7 +904,7 @@ fn retain_rwkv_rows_from_latest_learning_start(rows: &mut Vec<RwkvHistoricalRevi
     rows.retain_mut(|row| {
         let start = &starts[&row.card_id];
         let start_id = start.latest_learning_start.unwrap_or(start.first_review_id);
-        row.is_learning_start = row.review_id == start_id && row.review_kind == 0;
+        row.is_learning_start = Some(row.review_id) == start.latest_learning_start;
         row.review_id >= start_id
     });
 }
@@ -1185,6 +1299,90 @@ mod tests {
     }
 
     #[test]
+    fn rwkv_retrievability_prune_keeps_only_latest_run_keys() -> Result<()> {
+        use RwkvReviewRetrievabilitySampleRole::*;
+        let (col, _tempdir, _col_path) = temp_collection("rwkv-cache-prune")?;
+        let row = |revlog_id, sample_role, fold_index| RwkvReviewRetrievabilityCacheRow {
+            revlog_id: RevlogId(revlog_id),
+            prediction: 0.5,
+            sample_role,
+            fold_index,
+        };
+        let storage = &col.storage;
+        // Review 1 was test fold 2 in an earlier run and test fold 3 now; review
+        // 2 left the validation folds; review 3 no longer exists in history.
+        storage.set_rwkv_review_retrievability_predictions(
+            &[
+                row(1, TestFold, 2),
+                row(1, TestFold, 3),
+                row(2, TestFold, 1),
+            ],
+            "rwkv_calibration_recompute",
+        )?;
+        storage.set_rwkv_review_retrievability_predictions(
+            &[row(2, FinalFit, -1), row(3, FinalFit, -1)],
+            "rwkv_calibration_recompute",
+        )?;
+        storage.set_rwkv_review_retrievability_predictions(
+            &[row(2, FinalFit, -1)],
+            "rwkv_calibration_train",
+        )?;
+        storage.set_rwkv_review_retrievability_predictions(
+            &[row(1, PostOptimization, -1)],
+            "rwkv_review",
+        )?;
+        storage.set_rwkv_review_retrievability_predictions(
+            &[row(1, FinalFit, -1)],
+            "rwkv_state_cache_build",
+        )?;
+        let superseded = vec!["rwkv_calibration_train".to_string()];
+        let remaining = || -> Result<Vec<(i64, String, i32, String)>> {
+            let mut stmt = storage.db.prepare(&format!(
+                "SELECT revlog_id, sample_role, fold_index, source
+                 FROM {RWKV_REVIEW_RETRIEVABILITY_CACHE_TABLE}
+                 ORDER BY revlog_id, source, sample_role, fold_index"
+            ))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        };
+
+        // An empty run supersedes nothing.
+        assert_eq!(
+            storage.prune_rwkv_review_retrievability_rows(
+                "rwkv_calibration_recompute",
+                &[],
+                &superseded
+            )?,
+            0
+        );
+        assert_eq!(remaining()?.len(), 8);
+
+        let deleted = storage.prune_rwkv_review_retrievability_rows(
+            "rwkv_calibration_recompute",
+            &[(RevlogId(1), TestFold, 3), (RevlogId(2), FinalFit, -1)],
+            &superseded,
+        )?;
+        assert_eq!(deleted, 4);
+        let as_owned = |id: i64, role: &str, fold: i32, source: &str| {
+            (id, role.to_string(), fold, source.to_string())
+        };
+        assert_eq!(
+            remaining()?,
+            vec![
+                as_owned(1, "test_fold", 3, "rwkv_calibration_recompute"),
+                as_owned(1, "post_optimization", -1, "rwkv_review"),
+                as_owned(1, "final_fit", -1, "rwkv_state_cache_build"),
+                as_owned(2, "final_fit", -1, "rwkv_calibration_recompute"),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore]
     fn retrievability_cache_insert_benchmark() -> Result<()> {
         let row_count = std::env::var("ANKI_RETRIEVABILITY_CACHE_BENCH_ROWS")
@@ -1401,6 +1599,63 @@ mod tests {
             }
         }
         Ok(review_times)
+    }
+
+    #[test]
+    fn rwkv_historical_rows_preserve_learning_start_at_cutoff() {
+        for (cutoff, expected_ids, expected_starts) in [
+            (None, vec![3, 5, 6, 7, 8], vec![3, 5]),
+            (Some((1, 2)), vec![2, 3, 4, 5, 6, 7, 8], vec![2, 3]),
+            (Some((1, 5)), vec![3, 5, 6, 7, 8], vec![3, 5]),
+            (Some((1, 0)), vec![1, 2, 3, 4, 5, 6, 7, 8], vec![3]),
+            // A card whose first review is a preserved learning review keeps
+            // its history without marking that review as a learning start.
+            (Some((2, 0)), vec![3, 5, 6, 7, 8], vec![5]),
+        ] {
+            let mut rows = [
+                (1, 1, 1),
+                (2, 1, 0),
+                (3, 2, 0),
+                (4, 1, 1),
+                (5, 1, 0),
+                (6, 2, 1),
+                (7, 1, 0),
+                (8, 1, 1),
+            ]
+            .into_iter()
+            .map(
+                |(review_id, card_id, review_kind)| RwkvHistoricalReviewRow {
+                    review_id,
+                    card_id,
+                    review_kind,
+                    note_id: card_id,
+                    deck_id: 1,
+                    ease: 3,
+                    duration_millis: 1_000,
+                    interval_days: 1,
+                    ease_factor: 2_500,
+                    is_learning_start: false,
+                },
+            )
+            .collect::<Vec<_>>();
+            let cutoffs = cutoff.into_iter().collect();
+
+            retain_rwkv_rows_from_latest_learning_start(&mut rows, &cutoffs);
+
+            assert_eq!(
+                rows.iter().map(|row| row.review_id).collect::<Vec<_>>(),
+                expected_ids,
+                "cutoff: {cutoff:?}"
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.is_learning_start)
+                    .map(|row| row.review_id)
+                    .collect::<Vec<_>>(),
+                expected_starts,
+                "cutoff: {cutoff:?}"
+            );
+        }
     }
 
     /// The window-function query `rwkv_historical_review_rows` used before the

@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import os
+import socket
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -18,16 +20,95 @@ from aqt.mediasrv import (
     BundledFileRequest,
     LegacyPage,
     LocalFileRequest,
+    MediaServer,
     PageContext,
     UnsafePathException,
+    _editor_content_security_policy,
     _handle_builtin_file_request,
     _handle_local_file_request,
     _legacy_editor_content_security_policy,
+    _rwkv_raw_backend_mutation_note_ids,
+    _should_log_request,
     _untrusted_sveltekit_content_security_policy,
     ensure_safe_path,
     is_localhost_origin,
     legacy_page_data,
 )
+
+RWKV_AFTER_REVIEW_UNAVAILABLE_ROW = (
+    "RWKV : R After Review",
+    "Again:Unavailable Hard:Unavailable Good:Unavailable Easy:Unavailable",
+)
+RWKV_AFTER_TEN_MINUTES_UNAVAILABLE_ROW = (
+    "RWKV : R After 10min",
+    "Again:Unavailable Hard:Unavailable Good:Unavailable Easy:Unavailable",
+)
+RWKV_AFTER_REVIEW_UNAVAILABLE_ROWS = [
+    RWKV_AFTER_REVIEW_UNAVAILABLE_ROW,
+    RWKV_AFTER_TEN_MINUTES_UNAVAILABLE_ROW,
+]
+NEXT_S90_UNAVAILABLE_ROWS = [
+    (
+        "RWKV Curve Next S90",
+        "Again:Unavailable Hard:Unavailable Good:Unavailable Easy:Unavailable",
+    ),
+    (
+        "FSRS Next S90",
+        "Again:Unavailable Hard:Unavailable Good:Unavailable Easy:Unavailable",
+    ),
+]
+
+
+def test_media_server_shutdown_closes_listener_and_client_buffers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from waitress import create_server
+    from waitress.buffers import ReadOnlyFileBasedBuffer
+    from waitress.channel import HTTPChannel
+
+    media_server = MediaServer(mock.Mock())
+    media_server.server = create_server(lambda env, start: [], host="127.0.0.1", port=0)
+    server = media_server.server
+    client_socket, peer_socket = socket.socketpair()
+    output = tempfile.TemporaryFile()
+    try:
+        channel = HTTPChannel(
+            server, client_socket, ("127.0.0.1", 0), server.adj, map=server._map
+        )
+        channel.outbufs.append(ReadOnlyFileBasedBuffer(output))
+
+        media_server.shutdown()
+
+        assert not server._map
+        assert not channel.connected
+        assert output.closed
+        assert "unhandled close event" not in caplog.text
+    finally:
+        media_server.shutdown()
+        client_socket.close()
+        peer_socket.close()
+        output.close()
+
+
+def test_rwkv_raw_backend_mutation_scopes() -> None:
+    from anki import image_occlusion_pb2, notes_pb2
+
+    update_notes = notes_pb2.UpdateNotesRequest(
+        notes=[notes_pb2.Note(id=10), notes_pb2.Note(id=20)]
+    )
+    update_image = image_occlusion_pb2.UpdateImageOcclusionNoteRequest(note_id=30)
+
+    assert _rwkv_raw_backend_mutation_note_ids("add_note", b"") == ()
+    assert _rwkv_raw_backend_mutation_note_ids("add_image_occlusion_note", b"") == ()
+    assert _rwkv_raw_backend_mutation_note_ids(
+        "update_notes",
+        update_notes.SerializeToString(),
+    ) == (10, 20)
+    assert _rwkv_raw_backend_mutation_note_ids(
+        "update_image_occlusion_note",
+        update_image.SerializeToString(),
+    ) == (30,)
+    assert _rwkv_raw_backend_mutation_note_ids("remove_notes", b"") is None
 
 
 class TestEnsureSafePath:
@@ -357,3 +438,248 @@ class TestTrustedPageCSP:
         with app.test_request_context("/_anki/legacyPageData?id=1"):
             resp = legacy_page_data()
         assert _get_csp(resp) == _legacy_editor_content_security_policy(12345)
+
+
+class TestBuiltinFileCaching:
+    @pytest.mark.parametrize(
+        ("path", "development", "expected"),
+        [
+            ("js/deckbrowser.js", False, "max-age=31536000"),
+            ("css/deckbrowser.css", False, "max-age=31536000"),
+            ("imgs/anki-logo.svg", False, "max-age=31536000"),
+            ("js/deckbrowser.js", True, None),
+            ("css/deckbrowser.css", True, None),
+            ("imgs/anki-logo.svg", True, None),
+            ("deckbrowser.html", False, None),
+            ("sveltekit/index.html", False, None),
+            ("sveltekit/_app/immutable/start.js", False, "max-age=31536000"),
+            ("sveltekit/_app/immutable/start.js", True, "max-age=31536000"),
+        ],
+    )
+    def test_builtin_assets_cache_only_when_unchanged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        path: str,
+        development: bool,
+        expected: str | None,
+    ) -> None:
+        from aqt import mediasrv
+
+        monkeypatch.setattr(mediasrv, "dev_mode", development)
+        monkeypatch.setattr(mediasrv, "_builtin_data", lambda path: b"asset")
+
+        with mediasrv.app.test_request_context():
+            response = _handle_builtin_file_request(BundledFileRequest(path))
+
+        assert response.get_data() == b"asset"
+        assert response.headers.get("Cache-Control") == expected
+        if path.endswith(".html"):
+            assert _get_csp(response) == TRUSTED_PAGE_CSP
+
+    @pytest.mark.parametrize("untrusted", [True, False])
+    def test_local_media_and_addon_assets_keep_revalidation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, untrusted: bool
+    ) -> None:
+        from aqt import mediasrv
+
+        monkeypatch.setattr(mediasrv, "dev_mode", False)
+        (tmp_path / "addon.js").write_bytes(b"asset")
+
+        with mediasrv.app.test_request_context():
+            response = _handle_local_file_request(
+                LocalFileRequest(str(tmp_path), "addon.js", untrusted=untrusted)
+            )
+
+        response.direct_passthrough = False
+        assert response.get_data() == b"asset"
+        assert response.cache_control.max_age == 0
+        assert _get_csp(response) == (UNTRUSTED_MEDIA_CSP if untrusted else None)
+
+
+class TestCardStats:
+    @pytest.mark.parametrize(
+        "deck_config",
+        [
+            {"id": 1, "rwkvReviewEnabled": True},
+            {
+                "id": 1,
+                "other": {
+                    "jschoreels.fsrs": {
+                        "rwkv_review_enabled": True,
+                    },
+                },
+            },
+        ],
+    )
+    def test_card_info_includes_rwkv_diagnostics_without_reviewer_cache(
+        self, monkeypatch: pytest.MonkeyPatch, deck_config: dict[str, object]
+    ) -> None:
+        import aqt
+        from anki.stats_pb2 import CardStatsResponse
+        from aqt.mediasrv import app, card_stats
+        from aqt.rwkv_scheduler import (
+            RwkvIntervalOverride,
+            RwkvReviewPrediction,
+            set_reviewer_backend,
+        )
+
+        card = SimpleNamespace(id=123, did=10)
+        response = CardStatsResponse(card_id=123)
+
+        class Backend:
+            def predict_review(
+                self,
+                *,
+                reviewer: object,
+                card: object,
+            ) -> RwkvReviewPrediction:
+                return RwkvReviewPrediction(
+                    retrievability=0.61,
+                    interval_overrides=RwkvIntervalOverride(
+                        again=1,
+                        hard=2,
+                        good=4,
+                        easy=8,
+                    ),
+                )
+
+            def review_answered(
+                self,
+                *,
+                reviewer: object,
+                card: object,
+                ease: int,
+            ) -> None:
+                pass
+
+        class RawBackend:
+            def card_stats_raw(self, data: bytes) -> bytes:
+                return response.SerializeToString()
+
+        class Decks:
+            def config_dict_for_deck_id(self, deck_id: int) -> dict[str, object]:
+                assert deck_id == 10
+                return deck_config
+
+        class Collection:
+            _backend = RawBackend()
+            decks = Decks()
+
+            def get_card(self, card_id: int) -> object:
+                assert card_id == 123
+                return card
+
+        collection = Collection()
+        mw = SimpleNamespace(col=collection)
+        reviewer = SimpleNamespace(mw=mw)
+        mw.reviewer = reviewer
+
+        previous = set_reviewer_backend(Backend())
+        try:
+            monkeypatch.setattr(aqt, "mw", mw)
+            with app.test_request_context(data=b""):
+                raw_output = card_stats()
+        finally:
+            set_reviewer_backend(previous)
+
+        output = CardStatsResponse()
+        output.ParseFromString(raw_output)
+
+        assert [(row.label, row.value) for row in output.extra_rows] == [
+            ("RWKV computed R", "61%"),
+            ("Retrievability source", "RWKV"),
+            *NEXT_S90_UNAVAILABLE_ROWS,
+            *RWKV_AFTER_REVIEW_UNAVAILABLE_ROWS,
+        ]
+
+    def test_card_info_reports_rwkv_unavailable_when_backend_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import aqt
+        from anki.stats_pb2 import CardStatsResponse
+        from aqt.mediasrv import app, card_stats
+        from aqt.rwkv_scheduler import set_reviewer_backend
+
+        card = SimpleNamespace(id=123, did=10)
+        response = CardStatsResponse(card_id=123)
+        response.memory_state.stability = 1.0
+
+        class RawBackend:
+            def card_stats_raw(self, data: bytes) -> bytes:
+                return response.SerializeToString()
+
+        class Decks:
+            def config_dict_for_deck_id(self, deck_id: int) -> dict[str, object]:
+                assert deck_id == 10
+                return {"id": 1, "rwkvReviewEnabled": True}
+
+        class Collection:
+            _backend = RawBackend()
+            decks = Decks()
+
+            def get_card(self, card_id: int) -> object:
+                assert card_id == 123
+                return card
+
+        monkeypatch.delenv("ANKI_RWKV_BENCHMARK_PATH", raising=False)
+        monkeypatch.delenv("ANKI_RWKV_MODEL_PATH", raising=False)
+        monkeypatch.setattr("aqt.rwkv_scheduler.embedded_rwkv_model_path", lambda: None)
+        monkeypatch.setattr(aqt, "mw", SimpleNamespace(col=Collection()))
+        previous = set_reviewer_backend(None)
+        try:
+            with app.test_request_context(data=b""):
+                raw_output = card_stats()
+        finally:
+            set_reviewer_backend(previous)
+
+        output = CardStatsResponse()
+        output.ParseFromString(raw_output)
+
+        assert [(row.label, row.value) for row in output.extra_rows] == [
+            ("RWKV computed R", "Unavailable"),
+            ("Retrievability source", "FSRS (RWKV backend unavailable)"),
+            *NEXT_S90_UNAVAILABLE_ROWS,
+            *RWKV_AFTER_REVIEW_UNAVAILABLE_ROWS,
+        ]
+
+    def test_card_info_hook_can_append_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import aqt
+        from anki.stats_pb2 import CardStatsResponse
+        from aqt import gui_hooks
+        from aqt.browser.card_info import CardInfoRow
+        from aqt.mediasrv import app, card_stats
+
+        card = object()
+        response = CardStatsResponse(card_id=123)
+
+        class Backend:
+            def card_stats_raw(self, data: bytes) -> bytes:
+                return response.SerializeToString()
+
+        class Collection:
+            _backend = Backend()
+
+            def get_card(self, card_id: int) -> object:
+                assert card_id == 123
+                return card
+
+        def add_row(rows: list[CardInfoRow], hook_card: object) -> None:
+            assert hook_card is card
+            rows.append(CardInfoRow(label="Dynamic DR", value="0.71"))
+
+        monkeypatch.setattr(aqt, "mw", SimpleNamespace(col=Collection()))
+        gui_hooks.card_info_will_add_rows.append(add_row)
+        try:
+            with app.test_request_context(data=b""):
+                raw_output = card_stats()
+        finally:
+            gui_hooks.card_info_will_add_rows.remove(add_row)
+
+        output = CardStatsResponse()
+        output.ParseFromString(raw_output)
+
+        assert len(output.extra_rows) == 1
+        assert output.extra_rows[0].label == "Dynamic DR"
+        assert output.extra_rows[0].value == "0.71"

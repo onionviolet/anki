@@ -1,21 +1,59 @@
 # RWKV Review Scheduler
 
-The RWKV review scheduler is a desktop-only review-time scheduler. When **Use
-RWKV-Curve for answer intervals** is enabled, answer buttons use RWKV-Curve
-intervals and store RWKV-Curve S90 values. RWKV-Instant retrievability is
-recorded on live review answers and can separately be used for review queue
-selection when **Use RWKV-Instant to choose review cards** is enabled. To use
-RWKV-Curve without RWKV-Instant ordering, enable the first option and leave the
-second disabled. To use FSRS intervals with RWKV-Instant queue selection, leave
-the first option disabled and enable the second. Mobile clients do not load the
-RWKV backend and continue to schedule with FSRS/SM2.
+The RWKV review scheduler is a desktop-only review-time scheduler. In Deck
+Options, **Scheduler → Review scheduler** selects FSRS-6, FSRS-7, RWKV-Curve,
+or RWKV-Instant for the preset. Curve uses RWKV-Curve answer intervals and stores
+RWKV-Curve S90 values. Instant selects review cards independently of their
+scheduled due dates.
+
+With Instant selected, **Fallback : Due-Date Calculator** chooses FSRS-6,
+FSRS-7, or RWKV-Curve to write intervals and due dates for mobile sync and
+statistics. The selectors offer only current models. Existing FSRS-4.5 and FSRS-5 choices
+remain saved until a current model is explicitly selected.
+Choosing Instant keeps the preset's previous interval model as its initial
+companion. In **Review scheduler**, selecting an FSRS model disables both
+RWKV overrides; selecting Curve disables Instant. These controls reuse the
+existing FSRS version and RWKV boolean fields without a new storage format or
+clearing model parameters. They replace the separate Curve and Instant enable
+switches.
+
+**Machine Learning Based scheduling** remains a visible, collection-wide switch.
+Selecting either model selector enables it, so an FSRS due-date choice uses the
+native FSRS scheduler. Turning it off retains Anki's existing global SM2 behavior
+for native interval scheduling; RWKV settings remain independent. The model
+selectors change the current preset, not the models selected on other presets.
+
+When Curve writes due dates, Deck Options shows desired retention and RWKV
+controls while hiding the FSRS-only interval preview and optimization controls.
+Scheduler keeps the global switch, model selectors, and shared desired retention.
+FSRS previews, optimization, and advanced settings appear in a separate FSRS card
+styled like the RWKV card. Instant with an FSRS fallback shows both model cards;
+the review scheduler's card comes first and its fallback follows. Instant with
+a Curve fallback shows only the RWKV card, with Instant before Curve. Ordering
+uses the selected models and keeps the existing components mounted, preserving
+editing state and the initial desired-retention baseline.
+Synced RWKV-Curve due dates can guide the next mobile session, but mobile
+clients do not load the RWKV backend and continue to schedule answers with
+FSRS/SM2. Choosing a model affects future answers; use the existing explicit
+reschedule controls to update stored due dates for cards already scheduled.
 
 RWKV-Curve keeps answer intervals and S90 values fractional while evaluating
 the predicted curve. Curve crossings are refined on the curve itself rather
 than treated as straight lines between search points. Live answer scheduling
 then applies the same queue rule as FSRS-7: intervals below 12 hours use exact
-intraday seconds without fuzz, while intervals at or above 12 hours use normal
-whole-day fuzz and answer-button ordering.
+intraday seconds without fuzz only when **Allow same day review for
+(re)learning steps** is enabled and learning queues are enabled. Otherwise,
+generated intervals use day-based review states with a minimum of one day.
+Configured learning/relearning steps still take precedence while learning queues
+are enabled. Intervals at or above 12 hours use normal whole-day fuzz and
+answer-button ordering.
+
+**Allow same day review for (re)learning steps** defaults to on; explicitly saved
+off choices are preserved. **Skip learning/relearning queues with FSRS/RWKV**
+defaults to off. Leave queue skipping off to use manual learning/relearning
+delays. Turning it on bypasses the delays without deleting the saved step lists;
+cards already graduated to Review do not automatically return to learning when
+it is turned off again.
 
 ## Settings And Storage
 
@@ -34,6 +72,22 @@ Desktop-only RWKV review settings are stored in deck config `other` under the
 `true`, and `rwkv_review_enforce_grade_order`, which defaults to `true`.
 Legacy configs may also contain `rwkv_review_batch_size`. It is retained for
 compatibility but is no longer exposed in Deck Options.
+
+RWKV-Instant uses the collection-wide **Allow same day review for (re)learning
+steps** switch as its sole same-day repeat control, even with FSRS disabled.
+Deck Options shows this switch when either FSRS or RWKV-Instant is enabled.
+The former `rwkv_review_allow_same_day_review` field is retained for storage
+compatibility but no longer affects scheduling or hides the repeat-spacing
+fields. The two spacing minimums appear in one row with units inside the fields.
+
+Deck Options hides `rwkv_review_refresh_on_exit` while retaining its saved
+behavior. Creation-time prediction is always enabled; the retained
+`rwkv_review_first_review_elapsed_from_card_creation` field no longer disables
+it. **RWKV support** is now a global option in the Dynamic Preset Selection
+add-on. The add-on stores `rwkv_dynamic_preset_replay` locally and writes it to
+the synced collection key `rwkvDynamicPresetReplay`. An explicit boolean takes
+precedence over all deck-preset replay choices, including an explicit `false`.
+Until the add-on option is saved, the former enabled-preset choice is preserved.
 
 Development code that reads deck configs through the legacy Python
 `DeckConfigDict` API should tolerate both shapes:
@@ -107,6 +161,12 @@ canonical history no longer includes them. The resident identity becomes
 unknown, so this state is never persisted or trusted as the cache identity, and
 the next canonical restore, normally at the next launch, rebuilds without those
 reviews. Undoing the deletion keeps the resident state.
+Deck deletion uses the same reconciliation, including subdecks and cards
+borrowed by filtered decks. Deleting an empty deck or cards without review
+history keeps the resident identity known. Deleting a filtered deck also keeps
+the state when its cards return to their original decks without changing their
+historical identities. Deletion and its undo/redo do not trigger an automatic
+recovery while that resident state remains ready.
 Broad mutations such as filtered-deck rebuilds remain
 conservative when dynamic preset routing rules make the affected identities
 ambiguous. Other collection mutations that can change replay inputs invalidate
@@ -338,6 +398,15 @@ Checkpoint construction and recovery validation derive all requested history
 prefixes in one chronological pass, and repeated model-identity checks reuse
 the content hash until the model file changes.
 
+The modification-marker shortcut is deliberately conservative. A changed
+add-on setting can force a fingerprint even if the resulting history is
+identical; setting an already identical config value does not advance the
+marker. Startup hooks run before the restore and may also change notes, cards,
+or preset routing, so their writes cannot all be ignored. In particular, the
+current preset overlay affects historical card identities even when dynamic
+preset replay is disabled. Skipping validation after startup writes would
+require proving that those writes preserved the replay inputs.
+
 Developers can compare the canonical Python builder with the Rust fingerprint
 on an explicit copied collection database. The command refuses an omitted path;
 never pass a live profile database:
@@ -396,15 +465,41 @@ due. A scored review card is
 considered due when its RWKV retrievability is at or below the card's current
 target retention; cards above that threshold are not admitted through either the
 RWKV ordering path or the normal due fallback until a later prediction puts them
-back below target. When
-`rwkv_review_allow_same_day_review` is disabled, scored review cards that were
-already answered during the current scheduler day are also withheld until the
-next day. When same-day RWKV re-review is enabled,
+back below target. Turning off **Allow same day review for (re)learning steps**
+withholds scored review cards already answered during the current scheduler day
+until the next day. This applies with or without FSRS and even when **Skip
+learning/relearning queues with FSRS/RWKV** is enabled. Queue selection, deck
+counts, daily minimums, and `is:rwkv:due` searches use this same rule; the legacy
+`rwkv_review_allow_same_day_review` value is ignored.
+When the shared same-day switch permits RWKV re-review,
 `rwkv_review_min_intervening_reviews` can require a number of other answered
 reviews in the selected deck tree before the same card is admitted again, and
 `rwkv_review_min_elapsed_secs` can require that many seconds since the card's
-stored last review time. If both values are nonzero, both guards must be
-satisfied.
+stored last review time. Both guards must be satisfied; setting either value
+to `0` removes that minimum.
+
+While RWKV-Instant is enabled for the selected deck, these same spacing guards
+also apply to learning and relearning cards in that deck tree. They are checked
+when selecting cards, including already-due steps and cards pulled forward by
+Learn ahead, and the reviewer learning count excludes withheld cards. Each
+selection reads the latest answer time and recent answered reviews, so answers,
+undo, redo, and elapsed time update eligibility without changing stored due
+times or step lists. These guards do not apply Instant's recall threshold to
+learning cards: their configured or generated intervals still determine when
+they are due or fall inside the Learn ahead window. Disabling Instant preserves
+normal learning selection. An already displayed card, or a card explicitly
+restored by Undo, remains answerable.
+
+Answering Again on a card already answered during the current scheduler day
+does not increase its lapse count or trigger leech tagging or suspension.
+This applies regardless of queue skipping or scheduler, including rescheduling
+filtered decks and **Grade Now**. A review card's first answer of a scheduler day
+still adds a lapse when answered Again; subsequent answers that day do not, even
+if the first answer was successful. Learning and relearning answers continue to
+preserve the existing lapse count.
+Each answer is still recorded and updates the scheduling model. The day boundary
+uses Anki's configured rollover time, including when the last answer time must
+be recovered from the revlog.
 
 RWKV-selected cards also honor the general **Same-day reviews ignore review
 limit** daily-limits option. When enabled, an eligible scored card already
@@ -444,6 +539,12 @@ descendants, but a map prepared for an unrelated deck is ignored. Deck-count
 adjustments likewise ignore scored cards that no longer belong to the declared
 deck tree.
 
+Installing RWKV queue scores or clearing an existing queue score map invalidates
+the study queue. An empty update with no installed queue score map retains the
+queue, including progress through the new/review mix. Queue preparation still
+clears the count-only cache. This also applies when RWKV-Instant ordering is
+disabled.
+
 When a review-time queue refresh runs after the next question is displayed,
 the reviewer temporarily shows an ellipsis for the review due count. After the
 new RWKV score map is installed, the footer is updated asynchronously from a
@@ -455,14 +556,15 @@ suspending, or restoring cards, discard transient scores and cached inputs and
 advance a queue generation. Model work prepared before that mutation is
 rejected when it tries to install.
 
-By default, RWKV uses the time since a new card was created only when predicting
+RWKV always uses the time since a new card was created only when predicting
 retrievability before its first Learning review. The corresponding answer is
 processed with elapsed time unknown, so creation time does not enter recurrent
 state or affect later predictions. Historical calibration replay uses the same
 split: its query sees creation time, while its answer-state update does not.
 Cards whose retained history does not start with Learning do not use creation
-time. Disable `rwkv_review_first_review_elapsed_from_card_creation` to treat
-elapsed time as unknown for the initial prediction as well.
+time. The former deck-option toggle is hidden, and saved `false` values no
+longer disable creation-time prediction. Explicit elapsed-source overrides
+remain available to diagnostic replay tools.
 
 If RWKV-Curve is enabled but `rwkv_review_instant_order_enabled` is disabled,
 review-order retrievability settings do not use FSRS exact retrievability as a
@@ -518,7 +620,12 @@ and intervening review history. Parent counts are evaluated independently of
 their children's displayed counts: a parent requiring six intervening reviews
 can show zero while a child requiring two shows one. The uncapped review total
 used by daily-limit labels follows the same scope, so different repeat
-eligibility is not presented as a daily-limit restriction. The currently
+eligibility is not presented as a daily-limit restriction. The reviewer's bottom
+bar shows the same uncapped total in grey beside the green review count when
+the total is larger, for example `157 (/959)`. It includes the selected deck's
+subdecks and updates after answers and RWKV queue refreshes. While the review
+count is pending, the total label is hidden until fresh counts are available.
+The currently
 selected scope is processed first. While a scope is pending, its review due count and the
 review due counts of its descendants display an ellipsis instead of the stored
 FSRS count. A completed scope reveals its RWKV count; a skipped or failed scope
@@ -585,6 +692,29 @@ RWKV backend, and prepare fresh scores before the final search. Cards without a
 fresh applicable prediction do not match either predicate. Candidate discovery
 temporarily broadens the RWKV-dependent predicates so future cards that the
 model considers due are not omitted before scoring.
+
+Filtered-deck preparation waits on its collection worker for concurrent RWKV
+predictions to release the resident backend, then holds that access through
+scoring and score publication. Blocking filtered-deck preparations share work
+with one another, separately from nonblocking Stats preparations that may
+return pending. If the captured RWKV state changes while waiting or a prediction
+fails, the operation still aborts before creating or rebuilding the filtered deck.
+
+Failed filtered-deck preparation logs warnings through `aqt.rwkv_scheduler` in
+the normal application log output. `RWKV filtered-deck preparation failed`
+identifies the operation, deck id/name, rescheduling setting, and both configured
+filters with their queries, limits, and order names, including zero-limit filters.
+The accompanying `RWKV filtered-deck scoring stopped` warning identifies the
+reason. Score preparation failures also record the phase, status, backend type,
+warm-up pending flag, expected/current model state generations, and elapsed time.
+Candidate search construction failures record the searches and traceback.
+Reasons distinguish `backend_busy`,
+`state_changed`, `state_unavailable`, `warmup_not_ready`, and
+`candidate_search_failed`; unexpected errors retain their traceback and scoring
+phase. A state change is not attributed to sync unless separate evidence identifies
+it. Debug logs also show preparation start/completion, with `not_required` when
+the filters do not need RWKV scores. Include these messages together when reporting
+a rebuild failure so the effective deck settings can be compared with the reason.
 
 Card Info refreshes its score through the RWKV review-candidate prediction path
 each time it renders instead of reusing a score installed by Card Info, review
@@ -655,7 +785,7 @@ ignored because it can make predicted retrievability increase with elapsed
 time. The interval is the first sampled downward crossing of the target; if the
 curve never reaches the target, the configured maximum interval is used.
 
-**Keep RWKV intervals in answer order** is enabled by default. It keeps
+**Enforce Again ≤ Hard ≤ Good ≤ Easy intervals** is enabled by default. It keeps
 `Again <= Hard <= Good <= Easy` for both the target-retention intervals and the
 per-grade S90 values. When neighboring RWKV predictions conflict, Anki replaces
 the conflicting estimates with their shared average until they are in order,
@@ -827,6 +957,7 @@ allows large `rwkv_review_refresh_interval` values during review while still
 refreshing a stale transient score map after the review session ends. If the
 latest review-time refresh has already installed a score map for the current
 RWKV state generation, Anki skips the redundant exit refresh.
+The option is no longer shown in Deck Options; its saved value is retained.
 
 Reviewer queue refreshes do not start an additional prediction-memo prewarm.
 The installed queue-score map already serves later queue builds, and another
@@ -864,6 +995,24 @@ the UI thread, but Anki blocks review/deck interaction until the cache build
 finishes so the saved state is current when the operation completes. During
 replay, the progress dialog shows how many historical reviews have been applied
 to the cache, elapsed time, and estimated time remaining.
+
+RWKV switches apply to each card's own deck preset, including the original deck
+of a filtered card. Enabling RWKV on a parent does not override a different
+subdeck preset. Saving deck or preset changes invalidates dependent predictions
+and schedules the same state recovery used by the overview, even during review.
+Recovery restores a compatible saved state or replays history when the preset
+routing or replay settings changed. The reviewer refreshes its queue after
+recovery without requiring an application restart. Concurrent recovery requests
+are coalesced, and a scheduled request is discarded if its collection has closed
+or changed.
+
+Open Card Info windows refresh after deck/preset setting changes and after a
+successful state load or build. Their retrievability-source label uses the
+current preset enablement even if an earlier diagnostic prediction remains
+available. The desktop `rwkv_state_did_prepare(mw)` GUI hook reports successful
+state preparation on the main thread; Card Info subscribes only while its window
+is open. An enabled card can still show RWKV as unavailable while recovery is in
+progress or after recovery fails.
 Before publication, Anki explicitly closes both the state-store writer and its
 cache-validation database readers. On Windows, publishing the rebuilt cache also
 retries transient file-sharing failures caused by another process briefly holding
@@ -894,7 +1043,11 @@ available, RWKV copies the active FSRS `validation_fold` review ids and fold
 indices into its `test_fold` rows. Other historical RWKV rows are written as
 `final_fit`, so comparison graphs evaluate both models on the same reviews.
 If FSRS validation data is unavailable, RWKV retains the chronological 70%
-train / 30% test split as a standalone fallback. The operation restores the
+train / 30% test split as a standalone fallback. Because the cache only
+rewrites rows whose prediction changed, a completed recompute then deletes its
+own source's rows outside the (review, role, fold) keys it just assigned, plus
+all legacy `rwkv_calibration_train` rows; answer-time `rwkv_review` and
+`rwkv_state_cache_build` rows are kept. The operation restores the
 active RWKV backend state afterward. Calibration graph consumers should ignore
 `final_fit` rows and use only `test_fold` plus future `post_optimization` rows.
 Add-ons that need these rows can call
@@ -907,6 +1060,24 @@ generation-scoped backend operation. A real answer that arrives during one of
 these temporary operations invalidates it and leaves state unready for replay
 from canonical history instead of letting the temporary snapshot erase the
 answer.
+
+A replay's pre-answer prediction depends only on the model, the replay
+semantics, and the reviews before it, never on the role it is stored under:
+two full recomputes, and a state build that records predictions, agree bit for
+bit. A completed recompute therefore records its **calibration epoch** in
+`calibration-epoch-v1.json` next to the state cache: the collection, model,
+replay semantics, store generation, snapshot segment, and snapshot history
+hash. While that lineage is unchanged, each live answer stores its pre-answer
+query as an `rwkv_calibration_recompute` `final_fit` row before the answer
+updates the state. Live queries use the per-review path and match the bulk
+replay within about 1e-7. When FSRS folds change,
+`ensure_rwkv_calibration_data()` first checks that every answer in the current
+history has such a row, then only writes the rows whose role or fold changed
+and prunes the rest, instead of replaying. A rebuild (new store generation), a
+recovery (new segment), ignored synced reviews, a model or replay-semantics
+change, or any answer without a recorded prediction falls back to the full
+recompute, which starts a new epoch. On a 224,000-review copy the relabel took
+6.5 s versus 21.3 s for the replay, with identical keys.
 
 ## Inference Runtime
 
@@ -1041,6 +1212,18 @@ no valid cache exists, Anki replays historical revlog answer rows for existing
 cards in chronological order and then writes a fresh local cache snapshot.
 UI-time prediction hooks only use that warmed state after it is ready.
 
+Full collection history preparation shares the Rust fingerprint traversal:
+history filtering, elapsed times, preset routing, per-card replay metadata,
+history hashing, and the recovery checkpoint are computed together in Rust.
+The desktop converts the returned review rows to its existing replay inputs.
+Explicit first-review elapsed overrides, ignored review ids, and preserved
+learning-start cutoffs retain the same semantics. Deck-scoped and incremental
+replay continue to use the desktop builder and its caller-supplied prefix maps.
+If the native preparation call fails, a warning records the error and the desktop
+builder retries the full history. An interrupted call is re-raised, not retried;
+progress callbacks, which can cancel preparation, run before and after it.
+This changes neither the persisted cache format nor the model's replay math.
+
 Historical replay in the embedded Rust runtime uses a bulk sequence-mode path.
 Pointwise work (norms, lerp mixes, projections, loras, heads) runs in parallel
 across reviews, while recurrent-state updates stay sequential within each card,
@@ -1086,6 +1269,37 @@ prediction parity and reports payload creation, native bridge calls, prediction
 object creation, and memo lookup/install/clear costs separately. Use an optimized
 build for native throughput comparisons. `--profile-history PATH` writes a
 separate Python profile; its instrumented timings are not throughput measurements.
+Use `--compare-history` to also time the Python replay builder and compare every
+review input, all final per-card metadata, and recovery checkpoint metadata with
+the native full-history result. This enables checkpoint preparation in both
+builders; the output reports the compared checkpoint prefix lengths.
+
+On 2026-09-28, preparation of 223,463 canonical reviews from a copied backup
+took a median 1.40s through the native builder versus 3.06s through Python.
+Every replay input and final metadata field matched. The 8,900-card prediction
+reference also matched exactly, including ordering.
+
+The same 2026-09-28 investigation tested resolving each query row's time-mixer
+state once for all eight mixes. Thirty alternating measurements were initially
+about 1.4% faster by paired median, but a repeat was unchanged (77.71ms original
+versus 77.70ms fused), so fusion on its own is neutral. With the fused
+traversal, 64-row and 256-row GEMM batches were each about 5% slower than the
+original 128-row path. All tested variants stayed within `1e-6` prediction error
+with no rank changes. Keep the 128-row batch until a repeatable end-to-end
+improvement is demonstrated. These are local Apple Silicon measurements, with
+background load checked separately, not a claim about other platforms.
+A later change on the same day did keep the fused time-shift mix
+(`time_shift_mix_row`), as part of the aarch64 query kernels in
+`rslib/src/rwkv/query_kernels.rs`. Its gain comes mainly from the NEON
+recurrence step (`single_timestep_query_fast_into`), the NEON
+`Norm::apply_batch`, and single-pass head normalization and bonus/gate kernels.
+Together they scored the 8,900-card deck about 12-14% faster in paired runs
+(for example 92.9ms to 81.5ms), with bit-identical predictions. Its
+batch/thread sweep again found 128 rows on all ten workers fastest (71ms).
+Separate worker-count runs measured the original path at approximately 117ms
+with four Rayon workers, 78ms with eight, and 71ms with twelve. The measured
+workload therefore still gained some throughput beyond eight workers; these
+timings alone do not identify Accelerate/matrix-coprocessor contention.
 
 For native arithmetic comparisons, use `--prediction-output PATH` on the
 baseline build, then `--prediction-reference PATH` on later builds. The reference
@@ -1413,7 +1627,7 @@ card's retained review history. This approximates the card as staying in its
 currently resolved preset for its lifetime without repeatedly evaluating add-on
 routing rules.
 
-If `rwkv_review_dynamic_preset_replay` is enabled on any RWKV-enabled preset,
+If **RWKV support** is enabled in the Dynamic Preset Selection add-on,
 and the current FSRS preset overlay includes structured `simulator_rules`, as
 produced by the dynamic preset add-on for interval-split presets, RWKV
 re-evaluates those rules against historical replay facts for every review. In
@@ -1431,7 +1645,7 @@ rules can be applied consistently to newer revlogs after a restart. If the
 count of historical revlogs through the cached checkpoint changes, if the
 configured RWKV model content changes, or if the local cache schema changes, the
 cache is treated as stale and rebuilt from history. Changing
-`rwkv_review_dynamic_preset_replay` also makes the cache stale, because the same
+the effective global replay choice also makes the cache stale, because the same
 historical reviews may be replayed into different preset streams.
 
 ## Review Undo And Redo

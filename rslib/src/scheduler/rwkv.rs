@@ -35,7 +35,16 @@ use crate::search::SortMode;
 use crate::search::StateKind;
 use crate::storage::RwkvHistoricalReviewRow;
 
+mod history;
+
 const RWKV_HISTORY_HASH_DOMAIN: &[u8] = b"anki-rwkv-state-cache-history-v1\0";
+
+#[derive(Default)]
+struct RwkvHistoricalReplayOptions {
+    preserved_learning_start_cutoffs: HashMap<i64, i64>,
+    first_review_uses_creation: Option<bool>,
+    recovery_checkpoint_max_age_millis: Option<i64>,
+}
 
 pub(crate) struct RwkvReviewRescheduleItem {
     pub(crate) card_id: CardId,
@@ -50,6 +59,19 @@ impl Collection {
         &mut self,
         input: RwkvHistoricalReviewFingerprintRequest,
     ) -> Result<RwkvHistoricalReviewFingerprintResponse> {
+        self.visit_rwkv_historical_reviews(input, Default::default(), |_, _, _| {})
+    }
+
+    /// Share canonical replay semantics between cache validation and rebuilds.
+    /// The visitor receives each retained review after hashing it, so
+    /// checkpoint metadata and its identity describe exactly the same
+    /// chronological prefix.
+    fn visit_rwkv_historical_reviews(
+        &mut self,
+        input: RwkvHistoricalReviewFingerprintRequest,
+        options: RwkvHistoricalReplayOptions,
+        mut visit: impl FnMut(RwkvHistoricalFingerprintReview, [u8; 32], bool),
+    ) -> Result<RwkvHistoricalReviewFingerprintResponse> {
         let started = std::time::Instant::now();
         let mut ignored_review_ids = input
             .ignored_review_ids
@@ -58,10 +80,19 @@ impl Collection {
             .collect::<Vec<_>>();
         ignored_review_ids.sort_unstable();
         ignored_review_ids.dedup();
-        let (rows, active_ignored_review_ids) = self
-            .storage
-            .rwkv_historical_review_rows(&ignored_review_ids)?;
+        let (rows, active_ignored_review_ids) =
+            self.storage.rwkv_historical_review_rows_with_cutoffs(
+                &ignored_review_ids,
+                &options.preserved_learning_start_cutoffs,
+            )?;
         let queried_review_count = rows.len() as u64;
+        let checkpoint_review_count = options.recovery_checkpoint_max_age_millis.and_then(|age| {
+            let cutoff = rows.last()?.review_id - age;
+            // Match the desktop checkpoint: retain at least one review in the
+            // prefix, and leave at least one review for recovery replay.
+            let count = rows.partition_point(|row| row.review_id <= cutoff).max(1);
+            (count < rows.len()).then_some(count)
+        });
         let timing = self.timing_today()?;
 
         let card_ids = rows
@@ -92,8 +123,19 @@ impl Collection {
         let mut review_count_by_card = HashMap::new();
         let mut history_hash = rwkv_empty_history_hash();
         let mut last_review_id = 0;
+        let expected_prefix_len = input
+            .expected_identity
+            .as_ref()
+            .map(|expected| expected.review_count)
+            .filter(|&count| count > 0 && count < queried_review_count);
+        let mut prefix_matches_expected = false;
 
-        for row in rows {
+        for (index, row) in rows.into_iter().enumerate() {
+            if Some(index as u64) == expected_prefix_len {
+                // The first review after the prefix must be strictly newer, as
+                // incremental replay resumes after the prefix's last review id.
+                prefix_matches_expected = prefix_matches_expected && row.review_id > last_review_id;
+            }
             let card_id = CardId(row.card_id);
             let day_offset = rwkv_historical_day_offset(row.review_id, &timing);
             let previous_review_id = previous_review_id_by_card.insert(card_id, row.review_id);
@@ -105,12 +147,14 @@ impl Collection {
                     ((row.review_id - previous_review_id) / 1000).max(0),
                 )
             } else if row.is_learning_start
-                && rwkv_first_review_uses_card_creation(
-                    row.deck_id,
-                    &decks_by_id,
-                    &configs_by_id,
-                    &input.first_review_uses_creation_by_config_id,
-                )
+                && options.first_review_uses_creation.unwrap_or_else(|| {
+                    rwkv_first_review_uses_card_creation(
+                        row.deck_id,
+                        &decks_by_id,
+                        &configs_by_id,
+                        &input.first_review_uses_creation_by_config_id,
+                    )
+                })
             {
                 let elapsed_seconds = ((row.review_id - row.card_id) / 1000).max(0);
                 (elapsed_seconds / 86_400, elapsed_seconds)
@@ -130,16 +174,26 @@ impl Collection {
             previous_interval_days_by_card.insert(card_id, row.interval_days);
             review_count_by_card.insert(card_id, review_count_so_far + 1);
             last_review_id = last_review_id.max(row.review_id);
-            history_hash = rwkv_history_hash_after_review(
+            let review = RwkvHistoricalFingerprintReview {
+                row,
+                stable_preset_id,
+                day_offset,
+                elapsed_days,
+                elapsed_seconds,
+            };
+            history_hash = rwkv_history_hash_after_review(history_hash, &review);
+            visit(
+                review,
                 history_hash,
-                &RwkvHistoricalFingerprintReview {
-                    row,
-                    stable_preset_id,
-                    day_offset,
-                    elapsed_days,
-                    elapsed_seconds,
-                },
+                Some(index + 1) == checkpoint_review_count,
             );
+            if Some(index as u64 + 1) == expected_prefix_len {
+                prefix_matches_expected =
+                    input.expected_identity.as_ref().is_some_and(|expected| {
+                        expected.last_review_id == last_review_id
+                            && expected.history_hash == rwkv_history_hash_hex(history_hash)
+                    });
+            }
         }
 
         tracing::debug!(
@@ -158,6 +212,7 @@ impl Collection {
                     && expected.review_count == queried_review_count
                     && expected.history_hash == history_hash
             });
+        let history_prefix_is_valid = all_ignored_review_ids_are_active && prefix_matches_expected;
         Ok(RwkvHistoricalReviewFingerprintResponse {
             last_review_id,
             review_count: queried_review_count,
@@ -165,6 +220,7 @@ impl Collection {
             active_ignored_review_ids,
             queried_review_count,
             history_is_valid,
+            history_prefix_is_valid,
         })
     }
 
@@ -387,7 +443,7 @@ impl Collection {
 
         for card in cards {
             let Some(state) =
-                self.rwkv_review_input_state(&card, timing, include_suspended_review, false)?
+                self.rwkv_review_input_state(&card, timing, include_suspended_review, true)?
             else {
                 continue;
             };
@@ -408,16 +464,6 @@ impl Collection {
                 disabled_config_cards += 1;
                 continue;
             }
-            let state = if config
-                .inner
-                .rwkv_review_first_review_elapsed_from_card_creation
-            {
-                self.rwkv_review_input_state(&card, timing, include_suspended_review, true)?
-                    .unwrap_or(state)
-            } else {
-                state
-            };
-
             eligible.push(RwkvReviewInputRowPartial {
                 target_retention: deck.effective_desired_retention(config),
                 batch_size: config.inner.rwkv_review_batch_size,
@@ -559,7 +605,7 @@ impl Collection {
         Ok(card.last_review_time)
     }
 
-    fn populate_rwkv_last_review_times(&self, cards: &mut [Card]) -> Result<()> {
+    pub(crate) fn populate_rwkv_last_review_times(&self, cards: &mut [Card]) -> Result<()> {
         let missing_card_ids: Vec<_> = cards
             .iter()
             .filter(|card| card.last_review_time.is_none())
@@ -637,6 +683,7 @@ fn node_explicitly_includes_new_cards(node: &Node, negated: bool) -> bool {
 pub(crate) struct RwkvReviewCandidateMetadata {
     pub(crate) target_retention: f32,
     pub(crate) reviewed_today: bool,
+    pub(crate) same_day_review_allowed: bool,
     pub(crate) elapsed_secs_since_last_review: Option<u32>,
     pub(crate) current_deck_id: DeckId,
     pub(crate) source_deck_id: DeckId,
@@ -653,6 +700,7 @@ pub(crate) fn rwkv_review_candidate_metadata(
     let mut metadata = HashMap::with_capacity(cards.len());
     let mut partial_by_card = HashMap::new();
     let mut without_card_target = Vec::new();
+    let same_day_review_allowed = col.get_config_bool(BoolKey::FsrsShortTermWithStepsEnabled);
 
     for card in cards {
         if card.queue != CardQueue::Review {
@@ -669,7 +717,10 @@ pub(crate) fn rwkv_review_candidate_metadata(
             fsrs_due_today: card.due <= timing.days_elapsed as i32,
         };
         if let Some(desired_retention) = card_desired_retention(&card) {
-            metadata.insert(card.id, partial.with_target_retention(desired_retention));
+            metadata.insert(
+                card.id,
+                partial.with_target_retention(desired_retention, same_day_review_allowed),
+            );
         } else {
             partial_by_card.insert(card.id, partial);
             without_card_target.push(card);
@@ -680,7 +731,7 @@ pub(crate) fn rwkv_review_candidate_metadata(
         if let Some(partial) = partial_by_card.remove(&card_id) {
             metadata.insert(
                 card_id,
-                partial.with_target_retention(preset.desired_retention),
+                partial.with_target_retention(preset.desired_retention, same_day_review_allowed),
             );
         }
     }
@@ -702,7 +753,6 @@ pub(crate) enum RwkvReviewScoreEligibility {
 pub(crate) fn rwkv_review_score_eligibility(
     score: f32,
     metadata: &RwkvReviewCandidateMetadata,
-    allow_same_day_review: bool,
     min_intervening_reviews: u32,
     min_elapsed_secs: u32,
     intervening_reviews: Option<u32>,
@@ -711,7 +761,6 @@ pub(crate) fn rwkv_review_score_eligibility(
     rwkv_review_score_eligibility_inner(
         score,
         metadata,
-        allow_same_day_review,
         min_intervening_reviews,
         min_elapsed_secs,
         intervening_reviews,
@@ -722,7 +771,6 @@ pub(crate) fn rwkv_review_score_eligibility(
 pub(crate) fn rwkv_review_score_eligibility_ignoring_retention(
     score: f32,
     metadata: &RwkvReviewCandidateMetadata,
-    allow_same_day_review: bool,
     min_intervening_reviews: u32,
     min_elapsed_secs: u32,
     intervening_reviews: Option<u32>,
@@ -730,7 +778,6 @@ pub(crate) fn rwkv_review_score_eligibility_ignoring_retention(
     rwkv_review_score_eligibility_inner(
         score,
         metadata,
-        allow_same_day_review,
         min_intervening_reviews,
         min_elapsed_secs,
         intervening_reviews,
@@ -770,7 +817,6 @@ fn rwkv_review_target_retention(
 fn rwkv_review_score_eligibility_inner(
     score: f32,
     metadata: &RwkvReviewCandidateMetadata,
-    allow_same_day_review: bool,
     min_intervening_reviews: u32,
     min_elapsed_secs: u32,
     intervening_reviews: Option<u32>,
@@ -785,16 +831,29 @@ fn rwkv_review_score_eligibility_inner(
 
     if !score.is_finite()
         || score_above_target
-        || (!allow_same_day_review && metadata.reviewed_today)
+        || (metadata.reviewed_today && !metadata.same_day_review_allowed)
     {
         return RwkvReviewScoreEligibility::Blocked;
     }
 
+    rwkv_repeat_spacing_eligibility(
+        metadata.elapsed_secs_since_last_review,
+        min_intervening_reviews,
+        min_elapsed_secs,
+        intervening_reviews,
+    )
+}
+
+pub(crate) fn rwkv_repeat_spacing_eligibility(
+    elapsed_secs_since_last_review: Option<u32>,
+    min_intervening_reviews: u32,
+    min_elapsed_secs: u32,
+    intervening_reviews: Option<u32>,
+) -> RwkvReviewScoreEligibility {
     let required_intervening_reviews =
         (!rwkv_review_intervening_reviews_elapsed(intervening_reviews, min_intervening_reviews))
             .then_some(min_intervening_reviews);
-    let remaining_elapsed_secs = metadata
-        .elapsed_secs_since_last_review
+    let remaining_elapsed_secs = elapsed_secs_since_last_review
         .filter(|elapsed_secs| *elapsed_secs < min_elapsed_secs)
         .map(|elapsed_secs| min_elapsed_secs - elapsed_secs);
     if required_intervening_reviews.is_some() || remaining_elapsed_secs.is_some() {
@@ -826,10 +885,15 @@ struct RwkvReviewCandidatePartial {
 }
 
 impl RwkvReviewCandidatePartial {
-    fn with_target_retention(self, target_retention: f32) -> RwkvReviewCandidateMetadata {
+    fn with_target_retention(
+        self,
+        target_retention: f32,
+        same_day_review_allowed: bool,
+    ) -> RwkvReviewCandidateMetadata {
         RwkvReviewCandidateMetadata {
             target_retention,
             reviewed_today: self.reviewed_today,
+            same_day_review_allowed,
             elapsed_secs_since_last_review: self.elapsed_secs_since_last_review,
             current_deck_id: self.current_deck_id,
             source_deck_id: self.source_deck_id,
@@ -900,13 +964,7 @@ fn rwkv_first_review_uses_card_creation(
             requested_values_by_config_id
                 .get(&config_id.0)
                 .copied()
-                .or_else(|| {
-                    configs_by_id.get(&config_id).map(|config| {
-                        config
-                            .inner
-                            .rwkv_review_first_review_elapsed_from_card_creation
-                    })
-                })
+                .or_else(|| configs_by_id.get(&config_id).map(|_| true))
                 .unwrap_or(false)
         })
 }
@@ -1075,10 +1133,8 @@ fn valid_card_desired_retention(desired_retention: f32) -> bool {
 }
 
 pub(crate) fn card_reviewed_today(card: &Card, timing: SchedTimingToday) -> bool {
-    card.last_review_time.is_some_and(|last_review_time| {
-        let today_start = timing.next_day_at.0.saturating_sub(86_400);
-        last_review_time.0 >= today_start && last_review_time.0 < timing.next_day_at.0
-    })
+    card.last_review_time
+        .is_some_and(|last_review_time| timing.is_today(last_review_time))
 }
 
 fn rwkv_rescheduled_memory_state(card: &Card, s90: f32) -> FsrsMemoryState {
@@ -1237,6 +1293,71 @@ mod test {
                 ..Default::default()
             })?;
         assert!(!stale_ignored_fingerprint.history_is_valid);
+
+        Ok(())
+    }
+
+    #[test]
+    fn historical_fingerprint_validates_appended_history_prefix() -> Result<()> {
+        let mut col = Collection::new();
+        let mut card = Card::new(NoteId(10), 0, DeckId(1), 0);
+        col.add_card(&mut card)?;
+        let first_review_id = card.id.0 + 10_000;
+        let add_review = |col: &mut Collection, review_id: i64, review_kind| {
+            col.storage.add_revlog_entry(
+                &RevlogEntry {
+                    id: RevlogId(review_id),
+                    cid: card.id,
+                    usn: Usn(0),
+                    button_chosen: 3,
+                    interval: 1,
+                    ease_factor: 2_500,
+                    taken_millis: 1_000,
+                    review_kind,
+                    ..Default::default()
+                },
+                false,
+            )
+        };
+        add_review(&mut col, first_review_id, RevlogReviewKind::Learning)?;
+        add_review(&mut col, first_review_id + 2_000, RevlogReviewKind::Review)?;
+        let prefix = col
+            .rwkv_historical_review_fingerprint(RwkvHistoricalReviewFingerprintRequest::default())?;
+        let fingerprint_against_prefix = |col: &mut Collection| {
+            col.rwkv_historical_review_fingerprint(RwkvHistoricalReviewFingerprintRequest {
+                expected_identity: Some(scheduler::RwkvHistoricalReviewIdentity {
+                    last_review_id: prefix.last_review_id,
+                    review_count: prefix.review_count,
+                    history_hash: prefix.history_hash.clone(),
+                }),
+                ..Default::default()
+            })
+        };
+
+        let unchanged = fingerprint_against_prefix(&mut col)?;
+        assert!(unchanged.history_is_valid);
+        assert!(!unchanged.history_prefix_is_valid);
+
+        add_review(&mut col, first_review_id + 3_000, RevlogReviewKind::Review)?;
+        let appended = fingerprint_against_prefix(&mut col)?;
+        assert!(!appended.history_is_valid);
+        assert!(appended.history_prefix_is_valid);
+
+        add_review(&mut col, first_review_id + 1_000, RevlogReviewKind::Review)?;
+        let inserted = fingerprint_against_prefix(&mut col)?;
+        assert!(!inserted.history_is_valid);
+        assert!(!inserted.history_prefix_is_valid);
+
+        col.storage
+            .remove_revlog_entry(RevlogId(first_review_id + 1_000))?;
+        add_review(
+            &mut col,
+            first_review_id + 4_000,
+            RevlogReviewKind::Learning,
+        )?;
+        let relearned = fingerprint_against_prefix(&mut col)?;
+        assert!(!relearned.history_is_valid);
+        assert!(!relearned.history_prefix_is_valid);
 
         Ok(())
     }
@@ -1516,7 +1637,7 @@ mod test {
         let mut col = Collection::new();
         col.update_default_deck_config(|config| {
             config.rwkv_review_enabled = true;
-            config.rwkv_review_first_review_elapsed_from_card_creation = true;
+            config.rwkv_review_first_review_elapsed_from_card_creation = false;
         });
         let timing = col.timing_today()?;
         let mut card = Card::new(NoteId(10), 0, DeckId(1), timing.days_elapsed as i32);
@@ -1681,7 +1802,7 @@ mod test {
         let mut col = Collection::new();
         col.update_default_deck_config(|config| {
             config.rwkv_review_enabled = true;
-            config.rwkv_review_first_review_elapsed_from_card_creation = true;
+            config.rwkv_review_first_review_elapsed_from_card_creation = false;
         });
         let deck = col.get_or_create_normal_deck("Default")?;
         let timing = col.timing_today()?;

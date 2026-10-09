@@ -224,18 +224,30 @@ retrievability properties (`prop:r`, `prop:rwkv:r`, or
 selected FSRS preset.
 
 Deck options also expose the global FSRS short-term toggle backed by
-`BoolKey::FsrsShortTermWithStepsEnabled`. It controls the legacy FSRS
-short-term path. FSRS-7 always keeps an unrounded interval below 12 hours in
-the intraday learning/relearning queue, unless learning queues are disabled.
+`BoolKey::FsrsShortTermWithStepsEnabled`, which defaults to enabled. A stored
+disabled choice is preserved; the default applies when the key is absent. It
+controls generated short-term intervals for all FSRS versions and RWKV-Curve.
+FSRS-7 and RWKV-Curve keep an unrounded interval below 12 hours in the intraday
+learning/relearning queue only when this toggle is enabled and learning queues
+are enabled. Otherwise, generated intervals use day-based review states with a
+minimum of one day, including when configured steps are empty or exhausted.
 Intervals of 12 hours or more are fuzzed into whole days, with day-based answer
 buttons kept in strict order where the maximum interval permits it. Configured
-learning and relearning steps still take precedence.
+learning and relearning steps still take precedence while learning queues are
+enabled, regardless of the short-term toggle. Fractional elapsed-time and memory
+state calculations remain independent of the toggle.
 
 Deck options also expose a global FSRS learning-queue bypass backed by
 `BoolKey::FsrsLearningQueuesDisabled`. It defaults to disabled. When enabled
 with FSRS active, answering cards schedules review states directly instead of
 writing learning/relearning queue states, including configured steps and FSRS
 short-term intervals below half a day.
+
+Keep the learning-queue bypass disabled when configured learning/relearning step
+delays should run. Enabling it skips those delays without deleting the preset's
+step lists. Turning it off makes the saved steps available again; cards already
+graduated to Review are not moved back into learning automatically. The bypass
+has no effect on SM2 when FSRS is disabled.
 
 When FSRS computes a failing review interval for `Again`, the scheduler clamps
 that interval to the deck preset's minimum lapse interval and maximum review
@@ -292,9 +304,10 @@ FSRS training-item extraction is model-family-aware:
 - FSRS-7 includes same-day (`delta_t == 0`) follow-up targets during
   optimization/evaluation item generation.
 - Revlog-derived training items keep an aligned card-id vector after sorting by
-  review id. Final FSRS-7 uses the standard tensor optimizer path in `fsrs-rs`;
-  the previous windowed analytic optimizer is not used because it was tied to
-  the old single-stability parameter layout.
+  review id. Final FSRS-7 uses the native windowed analytic optimizer in
+  `fsrs-rs`. ARM with NEON uses its existing native kernel; other targets use
+  an eight-card f32 kernel with a second thread when more than one CPU is
+  available. Gradient groups are accumulated in a fixed order.
 - Optimize progress now reports:
     - total training targets,
     - long-term targets (`delta_t >= 1`),
@@ -343,11 +356,23 @@ Runtime parameter lookup uses the selected version first; if that array is not
 usable (`17/19/21/34` length with finite values), it falls back to best
 available parameters for compatibility with existing collections.
 
-FSRS optimization follows the training objective implemented in `fsrs-rs`. Anki
-does not apply the legacy raw-logloss post-filter to optimizer output, because
-optimized parameters are selected by the regularized training objective, which
-can include L2 and, when enabled, schedule penalty terms depending on the model
-family. FSRS-7 scheduling penalties are disabled by default.
+FSRS optimization follows the training objective implemented in `fsrs-rs`,
+which includes L2 and, when enabled, scheduling penalties. FSRS-7 scheduling
+penalties are disabled by default. After optimization, Anki compares the current
+and computed FSRS-7 parameters on the same training targets and keeps the current
+parameters if their log loss is no worse. Existing parameters from older model
+families are preserved when there are fewer than 64 targets; with enough targets,
+the computed parameters are accepted without a cross-family log-loss comparison.
+Anki passes no custom training configuration, so FSRS-7 uses the library's
+model defaults: 9 epochs, learning rate 0.0118, and L2 weight 0.3333, with
+recency weights and scheduling penalties aligned with `srs-benchmark`.
+FSRS-7 starts from the bundled default parameters without pre-training initial
+stabilities. The library returns those defaults for fewer than 64 training
+targets, or only first long-term review targets, before Anki applies its
+parameter comparison. Anki preserves the current parameters without calling the
+optimizer when there are no targets. FSRS-6 retains its existing training behavior.
+Evaluation RMSE bins and universal model-comparison metrics are summed in
+sorted bin order, making repeated results identical for the same inputs.
 FSRS-7 optimization reads/writes `fsrs_params_7`.
 When optimizer output length does not match the selected preset's current
 parameter-family length (for example selected FSRS-6 vs optimizer returning
@@ -482,10 +507,20 @@ Current exact-vs-scalar status:
   on new FSRS writes, even when it matches `S90`. Scheduling and retrievability
   math use `s_int`; exact FSRS-7 retrievability also uses `s_fast` and `d`.
   The read fallback for legacy card data without `s_int` initially treats `s`
-  as both stability values. With FSRS enabled, collection open, normal sync,
-  scheduled `.apkg` import, and Check Database replace that incomplete state
-  from usable review history or from the complete model state whose S90 is the
-  stored `s`, without changing the card's interval or due date.
+  as both stability values. With FSRS enabled and the card's resolved preset
+  selecting FSRS-7, collection open, normal sync, scheduled `.apkg` import, and
+  Check Database repair states missing either `s_int` or `s_fast`. This includes
+  cards received from AnkiWeb whose missing `s_int` was already filled from `s`
+  during conversion and saving. Normal sync repairs after all incoming card and
+  review-log chunks have been merged.
+  Recovery replays usable review history with the current preset parameters;
+  without usable history, it infers a complete model state whose S90 is the
+  stored `s`. Changed parameters or incomplete history can prevent exact recovery
+  of the original traces. Repairs update only local card data, preserving card
+  modification times, USNs, intervals, due dates, and existing per-card desired
+  retention. Collection-open recovery also preserves the collection modification
+  time, so repair alone does not request a sync or repeatedly upload changes that
+  AnkiWeb strips again. Older FSRS models and complete FSRS-7 states are untouched.
 - FSRS-7's fast stability trace is stored in `card.data.s_fast` on new FSRS
   writes. Legacy card data without `s_fast` treats the internal slow stability
   as the fast trace fallback.

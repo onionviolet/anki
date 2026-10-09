@@ -45,6 +45,7 @@ const IGNORED_FOLDERS: &[&str] = &[
     "./qt/installer/windows-template",
     "./qt/installer/mac-template",
     "./integrations/chinese-support-3",
+    "./.claude/worktrees",
 ];
 
 fn main() -> Result<()> {

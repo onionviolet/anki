@@ -34,6 +34,7 @@ def test_ui_scale_is_applied_before_app_is_created(
 ) -> None:
     # Qt reads QT_SCALE_FACTOR when the app is constructed, so setting it
     # afterwards has no effect (#5676)
+    monkeypatch.delenv("QT_SCALE_FACTOR", raising=False)
     monkeypatch.setattr(ProfileManager, "uiScale", lambda self: 2.0)
     seen: list[str | None] = []
     fake_app_class = get_fake_app_class(

@@ -442,7 +442,7 @@ jobs:
           endpoint: https://eus.codesigning.azure.net/
           signing-account-name: anki-signing
           certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
-          files: ${{ github.workspace }}\out\portable\build\anki\windows\app\src\Anki Portable.exe
+          files: ${{ github.workspace }}\out\portable\build\anki\windows\visualstudio\x64\Release\Anki Portable.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -451,7 +451,7 @@ jobs:
         if: inputs.sign == true
         shell: pwsh
         run: |
-          $sig = Get-AuthenticodeSignature "out\portable\build\anki\windows\app\src\Anki Portable.exe"
+          $sig = Get-AuthenticodeSignature "out\portable\build\anki\windows\visualstudio\x64\Release\Anki Portable.exe"
           if ($sig.Status -ne "Valid") {
             Write-Error "Portable EXE signature status: $($sig.Status)"
             exit 1
@@ -479,7 +479,8 @@ jobs:
   build-windows-arm:
     needs: prepare
     runs-on: windows-11-vs2026-arm
-    timeout-minutes: 90    steps:
+    timeout-minutes: 120
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v4
         with:
           ref: ${{ github.sha }}
@@ -573,7 +574,7 @@ jobs:
           endpoint: https://eus.codesigning.azure.net/
           signing-account-name: anki-signing
           certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
-          files: ${{ github.workspace }}\out\portable\build\anki\windows\app\src\Anki Portable.exe
+          files: ${{ github.workspace }}\out\portable\build\anki\windows\visualstudio\ARM64\Release\Anki Portable.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -582,7 +583,7 @@ jobs:
         if: inputs.sign == true
         shell: pwsh
         run: |
-          $sig = Get-AuthenticodeSignature "out\portable\build\anki\windows\app\src\Anki Portable.exe"
+          $sig = Get-AuthenticodeSignature "out\portable\build\anki\windows\visualstudio\ARM64\Release\Anki Portable.exe"
           if ($sig.Status -ne "Valid") {
             Write-Error "Portable EXE signature status: $($sig.Status)"
             exit 1
@@ -599,9 +600,10 @@ jobs:
   package-windows-arm:
     needs: [prepare, build-windows-arm, sign-exe-windows-arm]
     runs-on: windows-11-vs2026-arm
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
-      ANKI_ARTIFACT_VERSION: ${{ needs.prepare.outputs.pep440_version }}    steps:
+      ANKI_ARTIFACT_VERSION: ${{ needs.prepare.outputs.pep440_version }}
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v4
         with:
           ref: ${{ github.sha }}
@@ -903,12 +905,14 @@ jobs:
           fi
 
           notes_start_tag=$(gh release list --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName // empty')
+          python3 .github/scripts/release_notes.py --version "$TAG_NAME" --output release-notes.md
 
           gh release create "$TAG_NAME" \
             dist/* \
             --draft \
             --target "$RELEASE_SHA" \
             --title "$RELEASE_NAME" \
+            --notes-file release-notes.md \
             --generate-notes \
             ${notes_start_tag:+--notes-start-tag "$notes_start_tag"} \
             ${prerelease_flag:+"$prerelease_flag"}

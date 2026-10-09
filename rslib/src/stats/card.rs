@@ -55,7 +55,7 @@ impl Collection {
                 .or_not_found(card.original_deck_id)?
         };
         if fsrs_enabled && card.ctype != CardType::New && card.memory_state.is_none() {
-            card.memory_state = self.compute_memory_state(card.id)?.state.map(Into::into);
+            self.compute_memory_state_on_card(&mut card)?;
         }
 
         let fsrs_preset = self.fsrs_preset_for_card(&card)?;
@@ -342,6 +342,65 @@ mod test {
         let (mut col, cid) = test_collection()?;
         let _report = col.card_stats(cid)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn stats_preserve_pending_review_with_missing_memory_state() -> Result<()> {
+        use crate::scheduler::answering::CardAnswer;
+        use crate::scheduler::answering::Rating;
+
+        for fsrs_enabled in [false, true] {
+            for skip_scheduling_states in [false, true] {
+                let (mut col, cid) = test_collection()?;
+                set_selected_fsrs7_params(&mut col, fsrs7_params_for_retrievability_test())?;
+                col.answer_easy();
+                let mut stored = col.storage.get_card(cid)?.unwrap();
+                stored.clear_fsrs_data();
+                stored.due = col.timing_today()?.days_elapsed as i32;
+                col.storage.update_card(&stored)?;
+                col.set_config_bool(BoolKey::Fsrs, fsrs_enabled, false)?;
+                col.clear_study_queues();
+
+                let queued = col.get_queued_cards(1, false, skip_scheduling_states)?;
+                let queued = queued.cards.first().unwrap();
+                assert_eq!(queued.card.id, cid);
+                assert_eq!(queued.states.is_none(), skip_scheduling_states);
+                assert_eq!(
+                    queued.card.memory_state.is_some(),
+                    fsrs_enabled && !skip_scheduling_states
+                );
+                let states = match queued.states.clone() {
+                    Some(states) => states,
+                    None => {
+                        col.get_scheduling_states_with_desired_retention_override(cid, Some(0.95))?
+                    }
+                };
+
+                let report = col.card_stats(cid)?;
+                assert_eq!(report.memory_state.is_some(), fsrs_enabled);
+                assert_eq!(report.fsrs_retrievability.is_some(), fsrs_enabled);
+                assert_eq!(col.storage.get_card(cid)?.unwrap(), stored);
+
+                col.answer_card(&mut CardAnswer {
+                    card_id: cid,
+                    current_state: states.current,
+                    new_state: states.good,
+                    rating: Rating::Good,
+                    answered_at: TimestampMillis::now(),
+                    milliseconds_taken: 0,
+                    custom_data: None,
+                    desired_retention_override: skip_scheduling_states.then_some(0.95),
+                    rwkv_s90: None,
+                    rwkv_retrievability: None,
+                    rwkv_review_kind: None,
+                    from_queue: true,
+                })?;
+                let answered = col.storage.get_card(cid)?.unwrap();
+                assert_eq!(answered.reps, stored.reps + 1);
+                assert_eq!(answered.memory_state.is_some(), fsrs_enabled);
+            }
+        }
         Ok(())
     }
 

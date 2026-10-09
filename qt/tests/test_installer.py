@@ -20,6 +20,7 @@ from tools.build_installer import (
     build,
     bundle_fcitx,
     compile_sources,
+    export_constraints,
     get_artifact_version,
     get_briefcase_config_args,
     get_briefcase_environ,
@@ -36,6 +37,7 @@ from tools.build_installer import (
     normalize_wheel_path,
     package,
     package_portable_archive,
+    remove_visualstudio_debug_info,
     repair_macos_anki_audio_layout,
 )
 
@@ -128,6 +130,27 @@ def test_sources_path(monkeypatch, tmp_path: Path, platform: str, root: str) -> 
     monkeypatch.setattr("sys.platform", platform)
     sources_path = get_briefcase_sources_path(tmp_path)
     assert sources_path.name == root
+
+
+@pytest.mark.parametrize("machine, arch", [("AMD64", "x64"), ("ARM64", "ARM64")])
+@pytest.mark.parametrize("portable", [False, True])
+def test_windows_package_excludes_debug_files(
+    monkeypatch, tmp_path: Path, machine: str, arch: str, portable: bool
+) -> None:
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    sources = (
+        tmp_path / "build" / "anki" / "windows" / "visualstudio" / arch / "Release"
+    )
+    assert get_briefcase_sources_path(tmp_path, portable=portable) == sources
+    sources.mkdir(parents=True)
+    name = PORTABLE_FORMAL_NAME if portable else "Anki"
+    for suffix in [".exe", ".pdb", ".exe.metagen"]:
+        (sources / f"{name}{suffix}").touch()
+
+    remove_visualstudio_debug_info(tmp_path, portable=portable)
+
+    assert sorted(path.name for path in sources.iterdir()) == [f"{name}.exe"]
 
 
 def test_portable_sources_path(monkeypatch, tmp_path: Path) -> None:
