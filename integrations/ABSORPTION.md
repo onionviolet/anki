@@ -134,3 +134,9 @@ Phase 4 source gate passed: 1,193 Rust tests (13 skipped), 1,182 Qt tests (6 ski
 [Upstream PR #5751](https://github.com/ankitects/anki/pull/5751), commit [`00814718e`](https://github.com/ankitects/anki/commit/00814718e5ca2ad61a2410119effd4cb40f5667e), is not included in the fetched upstream main. It preserves fractional mask coordinates instead of rounding pixels during conversion and includes round-trip regression tests. The contributor-list conflict retains both upstream entries and the source author.
 
 The C7/#5751 `just check` gate passed: 187 TypeScript tests and 1,182 Qt tests (6 skipped). Unchanged Rust and pylib targets reused the Phase 4 passing stamps.
+
+### C7: image occlusion save validation
+
+[Upstream PR #5758](https://github.com/ankitects/anki/pull/5758), commit [`64122a0cb`](https://github.com/ankitects/anki/commit/64122a0cb11e97f653f21b4ac1165e5593672af6), is not included in the fetched upstream main. Save calls expose success, no-mask validation, and backend-error results; the mobile bridge returns the save promise. This is the fetched PR head, whose commit message refers to #5753.
+
+The C7/#5758 `just check` gate passed: 187 TypeScript tests and 1,182 Qt tests (6 skipped). Unchanged Rust and pylib targets reused Phase 4 passing stamps.
