@@ -2879,4 +2879,53 @@ mod tests {
             .iter()
             .all(|c| (c.desired_retention - 0.7).abs() < 1e-6));
     }
+
+    #[test]
+    fn simulator_does_not_crash_with_review_priority_functions() {
+        let mut col = Collection::new();
+        let review_orders = [
+            ReviewCardOrder::Day,
+            ReviewCardOrder::DayThenDeck,
+            ReviewCardOrder::DeckThenDay,
+            ReviewCardOrder::IntervalsAscending,
+            ReviewCardOrder::IntervalsDescending,
+            ReviewCardOrder::EaseAscending,
+            ReviewCardOrder::EaseDescending,
+            ReviewCardOrder::RetrievabilityAscending,
+            ReviewCardOrder::RetrievabilityDescending,
+            ReviewCardOrder::RelativeOverdueness,
+            ReviewCardOrder::Random,
+            ReviewCardOrder::Added,
+            ReviewCardOrder::ReverseAdded,
+        ];
+
+        let parameters = [
+            &fsrs::DEFAULT_PARAMETERS[..],         // FSRS-7
+            &fsrs::FSRS6_DEFAULT_PARAMETERS[..],   // FSRS-6
+            &fsrs::FSRS6_DEFAULT_PARAMETERS[..19], // FSRS-5
+            &fsrs::FSRS6_DEFAULT_PARAMETERS[..17], // FSRS-4
+        ];
+
+        for params in parameters {
+            for review_order in review_orders {
+                let req = SimulateFsrsReviewRequest {
+                    params: params.to_vec(),
+                    review_order: review_order as i32,
+                    desired_retention: 0.85,
+                    deck_size: 50,
+                    days_to_simulate: 20,
+                    new_limit: 5,
+                    review_limit: 1000,
+                    max_interval: 365,
+                    historical_retention: 0.9,
+                    learning_step_count: 3,
+                    relearning_step_count: 2,
+                    suspend_after_lapse_count: Some(3),
+                    easy_days_percentages: vec![0.0; 7],
+                    ..Default::default()
+                };
+                let _ = col.simulate_review(req).unwrap();
+            }
+        }
+    }
 }

@@ -1339,6 +1339,9 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
     }
 
     async function computeAllParams(): Promise<void> {
+        if (!confirm(tr.deckConfigFsrsConfirmSaveAndOptimize())) {
+            return;
+        }
         await commitEditing();
         const incompatiblePresetNames = state.incompatibleFsrsParamPresetNames();
         if (incompatiblePresetNames.length) {
@@ -1360,7 +1363,8 @@ License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
             }
             state.clearIncompatibleFsrsParams();
         }
-        state.save(UpdateDeckConfigsMode.COMPUTE_ALL_PARAMS);
+        await state.save(UpdateDeckConfigsMode.COMPUTE_ALL_PARAMS);
+        window.location.reload();
     }
 
     function showSimulatorModal(modal: Modal) {

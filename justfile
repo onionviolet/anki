@@ -270,3 +270,8 @@ yarn := if os() == "windows" { "out\\extracted\\node\\yarn.cmd" } else { "out/ex
 uv := env("UV_BINARY", if os() == "windows" { "out\\extracted\\uv\\uv" } else { "out/extracted/uv/uv" })
 python := if os() == "windows" { ".\\out\\pyenv\\Scripts\\python.exe" } else { "out/pyenv/bin/python" }
 export UV_PROJECT_ENVIRONMENT := if os() == "windows" { "out\\pyenv" } else { "out/pyenv" }
+
+
+# Regenerate the workspace lockfile after merging dependency manifests.
+refresh-lockfile:
+    cargo generate-lockfile
