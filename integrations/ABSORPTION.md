@@ -140,3 +140,9 @@ The C7/#5751 `just check` gate passed: 187 TypeScript tests and 1,182 Qt tests (
 [Upstream PR #5758](https://github.com/ankitects/anki/pull/5758), commit [`64122a0cb`](https://github.com/ankitects/anki/commit/64122a0cb11e97f653f21b4ac1165e5593672af6), is not included in the fetched upstream main. Save calls expose success, no-mask validation, and backend-error results; the mobile bridge returns the save promise. This is the fetched PR head, whose commit message refers to #5753.
 
 The C7/#5758 `just check` gate passed: 187 TypeScript tests and 1,182 Qt tests (6 skipped). Unchanged Rust and pylib targets reused Phase 4 passing stamps.
+
+### C6: hourly review data
+
+[Upstream PR #5761](https://github.com/ankitects/anki/pull/5761), fetched head [`e70642658`](https://github.com/ankitects/anki/commit/e7064265840e35226e40c1803bd23e46b0c84290), contributes the backend feature from [`5638ff148`](https://github.com/ankitects/anki/commit/5638ff1485b96da072e70e014a3a5442e56ae2e4). Only the stats proto, graph response mapping, hourly aggregation and its test are absorbed, plus the contributor license entry from [`9b4c64296`](https://github.com/ankitects/anki/commit/9b4c64296d152586be6f8bc63d70ed0420d9757e). No heatmap UI is added. The test initializes the fork's extra graph-context maps and checks local hours, Anki day keys, filtered reviews, and excluded manual/rescheduled entries.
+
+The C6/#5761 `just check` gate passed: 1,194 Rust tests (13 skipped), 1,182 Qt tests (6 skipped), 215 pylib tests and 187 TypeScript tests, including the new hourly-data regression. C3 (later-only rescheduling) and C5 (sibling dispersal) remain follow-ups; C8 remains out of scope.
