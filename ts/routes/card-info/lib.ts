@@ -14,8 +14,30 @@ export interface StatsRow {
     value: string | number | bigint;
 }
 
+const rwkvRowLabels = [
+    "RWKV computed R",
+    "RWKV : Answer Button Probability",
+    "RWKV Curve Next S90",
+    "FSRS Next S90",
+    "RWKV : R After Review",
+    "RWKV : R After 10min",
+    "Retrievability source",
+] as const;
+
 export function rowsFromStats(stats: CardStatsResponse): StatsRow[] {
+    type ExtraRow = (typeof stats.extraRows)[number];
     const statsRows: StatsRow[] = [];
+    const movedRwkvRows = new Set<ExtraRow>();
+
+    function pushRwkvRows(): void {
+        for (const label of rwkvRowLabels) {
+            const row = stats.extraRows.find((row) => row.label === label);
+            if (row) {
+                statsRows.push(row);
+                movedRwkvRows.add(row);
+            }
+        }
+    }
 
     statsRows.push({ label: tr2.cardStatsAdded(), value: dateString(stats.added) });
 
@@ -71,12 +93,15 @@ export function rowsFromStats(stats: CardStatsResponse): StatsRow[] {
             label: tr2.cardStatsFsrsDifficulty(),
             value: `${difficulty}%`,
         });
-        if (stats.fsrsRetrievability) {
+        if (stats.fsrsRetrievability != null) {
             const retrievability = (stats.fsrsRetrievability * 100).toFixed(0);
             statsRows.push({
-                label: tr2.cardStatsFsrsRetrievability(),
+                label: tr2.cardStatsFsrsComputedR(),
                 value: `${retrievability}%`,
             });
+            if (stats.extraRows.some((row) => row.label === rwkvRowLabels[0])) {
+                pushRwkvRows();
+            }
         }
     } else if (stats.ease && !stats.fsrsEnabled) {
         // Don't show ease when FSRS is enabled even if memory states don't exist.
@@ -110,6 +135,12 @@ export function rowsFromStats(stats: CardStatsResponse): StatsRow[] {
     }
     statsRows.push({ label: tr2.cardStatsDeckName(), value: deck });
     statsRows.push({ label: tr2.cardStatsPreset(), value: stats.preset });
+
+    for (const row of stats.extraRows) {
+        if (!movedRwkvRows.has(row)) {
+            statsRows.push(row);
+        }
+    }
 
     statsRows.push({ label: tr2.cardStatsCardId(), value: stats.cardId });
     statsRows.push({ label: tr2.cardStatsNoteId(), value: stats.noteId });

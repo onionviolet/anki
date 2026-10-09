@@ -24,7 +24,13 @@ impl BackendCollectionService for Backend {
             .set_tr(self.tr.clone())
             .set_shared_progress_state(self.progress_state.clone());
 
-        *guard = Some(builder.build()?);
+        let mut col = builder.build()?;
+        if !self.server {
+            if let Err(err) = col.repair_foreign_fsrs_memory_states() {
+                tracing::warn!(?err, "repairing foreign FSRS memory states on open failed");
+            }
+        }
+        *guard = Some(col);
 
         Ok(())
     }
@@ -83,7 +89,7 @@ impl BackendCollectionService for Backend {
     }
 
     fn latest_progress(&self) -> Result<anki_proto::collection::Progress> {
-        let progress = self.progress_state.lock().unwrap().last_progress;
+        let progress = self.progress_state.lock().unwrap().last_progress.clone();
         Ok(progress_to_proto(progress, &self.tr))
     }
 

@@ -37,6 +37,7 @@ use crate::scheduler::fsrs::memory_state::get_last_revlog_info;
 use crate::scheduler::queue::BuryMode;
 use crate::scheduler::queue::DueCard;
 use crate::scheduler::queue::DueCardKind;
+use crate::scheduler::queue::DueCardWithState;
 use crate::scheduler::queue::NewCard;
 use crate::scheduler::timing::SchedTimingToday;
 use crate::timestamp::TimestampMillis;
@@ -47,6 +48,7 @@ use crate::types::Usn;
 pub(crate) struct CardFixStats {
     pub new_cards_fixed: usize,
     pub other_cards_fixed: usize,
+    pub fsrs_stability_fixed: usize,
     pub last_review_time_fixed: usize,
 }
 
@@ -99,6 +101,34 @@ fn row_to_card(row: &Row) -> result::Result<Card, rusqlite::Error> {
     })
 }
 
+fn row_to_due_card_with_state(row: &Row) -> result::Result<DueCardWithState, rusqlite::Error> {
+    let queue = row.get(4)?;
+    // Keep the shared decoder, including its malformed-data defaults.
+    let data: CardData = row.get(10)?;
+    Ok(DueCardWithState {
+        card: DueCard {
+            id: row.get(0)?,
+            note_id: row.get(1)?,
+            current_deck_id: row.get(2)?,
+            mtime: row.get(3)?,
+            due: row.get(5).ok().unwrap_or_default(),
+            reps: row.get(7)?,
+            original_deck_id: row.get(9)?,
+            kind: if queue == CardQueue::Review {
+                DueCardKind::Review
+            } else {
+                DueCardKind::Learning
+            },
+        },
+        queue,
+        interval: row.get(6)?,
+        original_due: row.get(8).ok().unwrap_or_default(),
+        memory_state: data.memory_state(),
+        desired_retention: data.fsrs_desired_retention,
+        last_review_time: data.last_review_time,
+    })
+}
+
 fn row_to_card_entry(row: &Row) -> Result<CardEntry> {
     Ok(CardEntry {
         id: row.get(0)?,
@@ -120,6 +150,25 @@ fn row_to_new_card(row: &Row) -> result::Result<NewCard, rusqlite::Error> {
 }
 
 impl super::SqliteStorage {
+    /// Return cards with an FSRS state written by a client that did not
+    /// preserve the model's internal stability fields.
+    pub(crate) fn card_ids_with_foreign_fsrs_state(&self) -> Result<Vec<CardId>> {
+        self.db
+            .prepare_cached(
+                r#"select id, data from cards
+where data like '%"s":%' and data not like '%"s_int":%'"#,
+            )?
+            .query_and_then([], |row| -> Result<Option<CardId>> {
+                let data: CardData = row.get(1)?;
+                let is_foreign = data.fsrs_stability.is_some()
+                    && data.fsrs_difficulty.is_some()
+                    && data.fsrs_stability_internal.is_none();
+                Ok(is_foreign.then(|| row.get(0)).transpose()?)
+            })?
+            .filter_map(Result::transpose)
+            .collect()
+    }
+
     pub fn get_card(&self, cid: CardId) -> Result<Option<Card>> {
         self.db
             .prepare_cached(concat!(include_str!("get_card.sql"), " where id = ?"))?
@@ -300,16 +349,103 @@ impl super::SqliteStorage {
         };
         let mut rows = stmt.query(params![queue as i8, timing.days_elapsed])?;
         while let Some(row) = rows.next()? {
-            if !func(DueCard {
-                id: row.get(0)?,
-                note_id: row.get(1)?,
-                due: row.get(2).ok().unwrap_or_default(),
-                mtime: row.get(4)?,
-                current_deck_id: row.get(5)?,
-                original_deck_id: row.get(6)?,
-                reps: row.get(7)?,
-                kind,
-            })? {
+            if !func(due_card_from_review_row(row, kind)?)? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Scheduling state for exact queue scoring, without an intermediate SQL
+    /// sort or one additional card lookup per candidate. The two ranges let
+    /// SQLite use the scheduling index with the appropriate day/second
+    /// cutoff.
+    pub(crate) fn due_cards_with_state_in_active_decks(
+        &self,
+        timing: SchedTimingToday,
+    ) -> Result<Vec<DueCardWithState>> {
+        self.db
+            .prepare_cached(concat!(
+                include_str!("get_due_card_state.sql"),
+                " where did in (select id from active_decks) and queue in (2, 3) and due <= ?1 union all ",
+                include_str!("get_due_card_state.sql"),
+                " where did in (select id from active_decks) and queue in (1, 4) and due <= ?2"
+            ))?
+            .query_and_then(params![timing.days_elapsed, timing.now.min(timing.next_day_at)], |row| {
+                row_to_due_card_with_state(row).map_err(Into::into)
+            })?
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn due_cards_full_state_for_benchmark(
+        &self,
+        timing: SchedTimingToday,
+    ) -> Result<Vec<Card>> {
+        self.db
+            .prepare_cached(concat!(
+                include_str!("get_card.sql"),
+                " where did in (select id from active_decks) and queue in (2, 3) and due <= ?1 union all ",
+                include_str!("get_card.sql"),
+                " where did in (select id from active_decks) and queue in (1, 4) and due <= ?2"
+            ))?
+            .query_and_then(params![timing.days_elapsed, timing.now.min(timing.next_day_at)], |row| {
+                row_to_card(row).map_err(Into::into)
+            })?
+            .collect()
+    }
+
+    /// Call func() for each requested review card in the active decks,
+    /// including cards whose due day is in the future.
+    pub(crate) fn for_each_review_card_in_active_decks_with_ids<F>(
+        &self,
+        card_ids: &[CardId],
+        mut func: F,
+    ) -> Result<()>
+    where
+        F: FnMut(DueCard) -> Result<bool>,
+    {
+        if card_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut ids = String::new();
+        ids_to_string(&mut ids, card_ids);
+        let sql =
+            include_str!("review_cards_in_active_decks_with_ids.sql").replace("CARD_IDS", &ids);
+        let mut stmt = self.db.prepare(&sql)?;
+        let mut rows = stmt.query(params![CardQueue::Review as i8])?;
+        while let Some(row) = rows.next()? {
+            if !func(due_card_from_review_row(row, DueCardKind::Review)?)? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Call func() for each review card in the active decks, including cards
+    /// whose due day is in the future, in the configured review order.
+    pub(crate) fn for_each_review_card_in_active_decks<F>(
+        &self,
+        timing: SchedTimingToday,
+        order: ReviewCardOrder,
+        fsrs: bool,
+        mut func: F,
+    ) -> Result<()>
+    where
+        F: FnMut(DueCard) -> Result<bool>,
+    {
+        let order_clause = review_order_sql(order, timing, fsrs);
+        let mut stmt = self.db.prepare_cached(&format!(
+            "{} order by {}",
+            include_str!("review_cards_in_active_decks.sql"),
+            order_clause
+        ))?;
+        let mut rows = stmt.query(params![CardQueue::Review as i8])?;
+        while let Some(row) = rows.next()? {
+            if !func(due_card_from_review_row(row, DueCardKind::Review)?)? {
                 break;
             }
         }
@@ -400,6 +536,7 @@ impl super::SqliteStorage {
             .db
             .prepare(include_str!("fix_ordinal.sql"))?
             .execute(params![mtime, usn])?;
+        let fsrs_stability_cnt = self.fix_zero_fsrs_stability(mtime, usn)?;
         let mut last_review_time_cnt = 0;
         let revlog = self.get_all_revlog_entries_in_card_order()?;
         let last_revlog_info = get_last_revlog_info(&revlog);
@@ -417,8 +554,37 @@ impl super::SqliteStorage {
         Ok(CardFixStats {
             new_cards_fixed: new_cnt,
             other_cards_fixed: other_cnt,
+            fsrs_stability_fixed: fsrs_stability_cnt,
             last_review_time_fixed: last_review_time_cnt,
         })
+    }
+
+    fn fix_zero_fsrs_stability(&self, mtime: TimestampSecs, usn: Usn) -> Result<usize> {
+        let card_ids: Vec<CardId> = self
+            .db
+            .prepare(
+                "select id from cards where
+                    data like '%\"s\":0,%' or data like '%\"s\":0.0,%' or
+                    data like '%\"s\":0}' or data like '%\"s\":0.0}'",
+            )?
+            .query_and_then([], |row| Ok(CardId(row.get(0)?)))?
+            .collect::<Result<_>>()?;
+        let mut fixed = 0;
+        for card_id in card_ids {
+            let Some(mut card) = self.get_card(card_id)? else {
+                continue;
+            };
+            let Some(memory_state) = card.memory_state else {
+                continue;
+            };
+            if memory_state.stability == 0.0 {
+                card.mtime = mtime;
+                card.usn = usn;
+                self.update_card(&card)?;
+                fixed += 1;
+            }
+        }
+        Ok(fixed)
     }
 
     pub(crate) fn delete_orphaned_cards(&self) -> Result<usize> {
@@ -600,6 +766,148 @@ impl super::SqliteStorage {
             .collect()
     }
 
+    pub(crate) fn rwkv_review_input_candidate_cards_for_ids(
+        &self,
+        card_ids: &[CardId],
+        include_suspended_review: bool,
+        include_new_cards: bool,
+        enabled_deck_ids: Option<&HashSet<DeckId>>,
+    ) -> Result<Vec<Card>> {
+        if card_ids.is_empty() || enabled_deck_ids.is_some_and(HashSet::is_empty) {
+            return Ok(Vec::new());
+        }
+
+        self.with_searched_cards_table(false, || {
+            self.set_search_table_to_card_ids(card_ids)?;
+            self.rwkv_review_input_candidate_cards_in_search(
+                include_suspended_review,
+                include_new_cards,
+                enabled_deck_ids,
+            )
+        })
+    }
+
+    pub(crate) fn rwkv_review_input_candidate_cards_for_deck_review_queue(
+        &self,
+        deck_ids: &[DeckId],
+        enabled_deck_ids: Option<&HashSet<DeckId>>,
+        include_new_cards: bool,
+    ) -> Result<(u32, Vec<Card>)> {
+        if deck_ids.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        let mut deck_ids_sql = String::new();
+        let mut sorted_deck_ids: Vec<_> = deck_ids.iter().map(|deck_id| deck_id.0).collect();
+        sorted_deck_ids.sort_unstable();
+        ids_to_string(&mut deck_ids_sql, sorted_deck_ids);
+
+        let searched_cards = self
+            .db
+            .prepare(&format!(
+                "select count() from cards where did in {deck_ids_sql} and queue in ({})",
+                if include_new_cards { "0, 2" } else { "2" }
+            ))?
+            .query_row([], |row| row.get(0))?;
+
+        if enabled_deck_ids.is_some_and(HashSet::is_empty) {
+            return Ok((searched_cards, Vec::new()));
+        }
+
+        let queue_filter = if include_new_cards {
+            format!(
+                "((type = {} and queue = {}) or (type = {} and queue = {}))",
+                CardType::Review as i8,
+                CardQueue::Review as i8,
+                CardType::New as i8,
+                CardQueue::New as i8,
+            )
+        } else {
+            format!(
+                "type = {} and queue = {}",
+                CardType::Review as i8,
+                CardQueue::Review as i8,
+            )
+        };
+
+        let mut sql = format!(
+            "{} where did in {deck_ids_sql} and {queue_filter}",
+            include_str!("get_card.sql"),
+        );
+
+        if let Some(enabled_deck_ids) = enabled_deck_ids {
+            let mut enabled_ids: Vec<_> =
+                enabled_deck_ids.iter().map(|deck_id| deck_id.0).collect();
+            enabled_ids.sort_unstable();
+            let mut enabled_ids_sql = String::new();
+            ids_to_string(&mut enabled_ids_sql, enabled_ids);
+            sql.push_str(" and (case when odid != 0 then odid else did end) in ");
+            sql.push_str(&enabled_ids_sql);
+        }
+
+        let cards = self
+            .db
+            .prepare(&sql)?
+            .query_and_then([], |r| row_to_card(r).map_err(Into::into))?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((searched_cards, cards))
+    }
+
+    pub(crate) fn rwkv_review_input_candidate_cards_in_search(
+        &self,
+        include_suspended_review: bool,
+        include_new_cards: bool,
+        enabled_deck_ids: Option<&HashSet<DeckId>>,
+    ) -> Result<Vec<Card>> {
+        if enabled_deck_ids.is_some_and(HashSet::is_empty) {
+            return Ok(Vec::new());
+        }
+
+        let new_card_filter = if include_new_cards {
+            format!(
+                "   or (type = {} and queue = {})\n",
+                CardType::New as i8,
+                CardQueue::New as i8,
+            )
+        } else {
+            String::new()
+        };
+        let mut sql = concat!(
+            include_str!("get_card.sql"),
+            " where id in (select cid from search_cids)\n",
+            " and (\n",
+            "   (type = 2 and queue in REVIEW_QUEUES)\n",
+            "   or (type = 1 and queue in (1, 3))\n",
+            "   or (type = 3 and queue in (1, 3))\n",
+            "NEW_CARD_FILTER",
+            " )\n",
+        )
+        .replace(
+            "REVIEW_QUEUES",
+            if include_suspended_review {
+                "(2, -1)"
+            } else {
+                "(2)"
+            },
+        )
+        .replace("NEW_CARD_FILTER", &new_card_filter);
+
+        if let Some(enabled_deck_ids) = enabled_deck_ids {
+            let mut deck_ids: Vec<_> = enabled_deck_ids.iter().map(|deck_id| deck_id.0).collect();
+            deck_ids.sort_unstable();
+            let mut deck_ids_sql = String::new();
+            ids_to_string(&mut deck_ids_sql, deck_ids);
+            sql.push_str(" and (case when odid != 0 then odid else did end) in ");
+            sql.push_str(&deck_ids_sql);
+        }
+
+        self.db
+            .prepare(&sql)?
+            .query_and_then([], |r| row_to_card(r).map_err(Into::into))?
+            .collect()
+    }
+
     pub(crate) fn all_searched_cards_in_search_order(&self) -> Result<Vec<Card>> {
         self.db
             .prepare_cached(concat!(
@@ -663,6 +971,22 @@ impl super::SqliteStorage {
             .collect()
     }
 
+    pub(crate) fn filtered_review_counts_by_original_deck(&self) -> Result<Vec<(DeckId, u32)>> {
+        self.db
+            .prepare_cached(
+                "select odid, count()
+                 from cards
+                 where odid > 0
+                   and queue in (?1, ?2)
+                 group by odid",
+            )?
+            .query_and_then(
+                params![CardQueue::Review as i8, CardQueue::DayLearn as i8],
+                |row| -> Result<_> { Ok((DeckId(row.get(0)?), row.get(1)?)) },
+            )?
+            .collect()
+    }
+
     pub(crate) fn congrats_info(&self, current: &Deck, today: u32) -> Result<CongratsInfo> {
         // NOTE: this line is obsolete in v3 as it's run on queue build, but kept to
         // prevent errors for v1/v2 users before they upgrade
@@ -720,6 +1044,20 @@ impl super::SqliteStorage {
         Ok(())
     }
 
+    pub(crate) fn setup_fsrs_preset_search_cards_table(&self) -> Result<()> {
+        self.db.execute_batch(
+            "DROP TABLE IF EXISTS fsrs_preset_search_cids;
+CREATE TEMPORARY TABLE fsrs_preset_search_cids (cid integer PRIMARY KEY NOT NULL);",
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_fsrs_preset_search_cards_table(&self) -> Result<()> {
+        self.db
+            .execute("drop table if exists fsrs_preset_search_cids", [])?;
+        Ok(())
+    }
+
     /// Injects the provided card IDs into the search_cids table, for
     /// when ids have arrived outside of a search.
     pub(crate) fn set_search_table_to_card_ids(&self, cards: &[CardId]) -> Result<()> {
@@ -729,6 +1067,55 @@ impl super::SqliteStorage {
         for cid in cards {
             stmt.execute([cid])?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn set_fsrs_preset_search_table_to_card_ids(&self, cards: &[CardId]) -> Result<()> {
+        let mut stmt = self
+            .db
+            .prepare_cached("insert into fsrs_preset_search_cids values (?)")?;
+        for cid in cards {
+            stmt.execute([cid])?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_fsrs_preset_search_table_card_ids(&self, cards: &[CardId]) -> Result<()> {
+        let mut stmt = self
+            .db
+            .prepare_cached("delete from fsrs_preset_search_cids where cid = ?")?;
+        for cid in cards {
+            stmt.execute([cid])?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn setup_fsrs_preset_first_grades_table(&self) -> Result<()> {
+        self.db.execute_batch(
+            "DROP TABLE IF EXISTS fsrs_preset_first_grades;
+CREATE TEMPORARY TABLE fsrs_preset_first_grades (
+  cid integer PRIMARY KEY NOT NULL,
+  ease integer NOT NULL
+);
+INSERT INTO fsrs_preset_first_grades
+SELECT sc.cid,
+  (
+    SELECT r.ease
+    FROM revlog r
+    WHERE r.cid = sc.cid
+      AND r.ease BETWEEN 1 AND 4
+    ORDER BY r.id
+    LIMIT 1
+  ) AS ease
+FROM fsrs_preset_search_cids sc
+WHERE ease IS NOT NULL;",
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn clear_fsrs_preset_first_grades_table(&self) -> Result<()> {
+        self.db
+            .execute("drop table if exists fsrs_preset_first_grades", [])?;
         Ok(())
     }
 
@@ -786,6 +1173,19 @@ impl super::SqliteStorage {
             .collect::<rusqlite::Result<_>>()
             .unwrap()
     }
+}
+
+fn due_card_from_review_row(row: &Row<'_>, kind: DueCardKind) -> Result<DueCard> {
+    Ok(DueCard {
+        id: row.get(0)?,
+        note_id: row.get(1)?,
+        due: row.get(2).ok().unwrap_or_default(),
+        mtime: row.get(4)?,
+        current_deck_id: row.get(5)?,
+        original_deck_id: row.get(6)?,
+        reps: row.get(7)?,
+        kind,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -889,7 +1289,10 @@ fn review_order_sql(order: ReviewCardOrder, timing: SchedTimingToday, fsrs: bool
         ReviewCardOrder::RelativeOverdueness => {
             vec![ReviewOrderSubclause::RelativeOverdueness { fsrs, timing }]
         }
-        ReviewCardOrder::Random => vec![],
+        // Draw from the entire pool before queue gathering applies eligibility
+        // and deck limits. A stable id/mtime hash lets recently answered cards
+        // jump ahead of a backlog whose low hashes have already been consumed.
+        ReviewCardOrder::Random => return "random()".into(),
         ReviewCardOrder::Added => vec![ReviewOrderSubclause::Added],
         ReviewCardOrder::ReverseAdded => vec![ReviewOrderSubclause::ReverseAdded],
     };
@@ -961,6 +1364,112 @@ mod test {
         let id1 = card.id;
         storage.add_card(&mut card).unwrap();
         assert_ne!(id1, card.id);
+    }
+
+    #[test]
+    fn due_card_state_matches_full_card_decoding() -> crate::error::Result<()> {
+        use super::row_to_card;
+        use super::row_to_due_card_with_state;
+        use crate::scheduler::queue::DueCardWithState;
+
+        let storage = create_test_storage();
+        // Query synthetic rows, including values older clients may have stored.
+        // No collection file or persisted fixture is involved.
+        let row = r#"with cards as (select
+            42 as id, 43 as nid, 44 as did, 2 as ord, 1234.5 as mod,
+            0 as usn, 2 as type, ?1 as queue, ?2 as due, 12.5 as ivl,
+            2500 as factor, 17 as reps, 3 as lapses, 2 as left,
+            ?2 as odue, ?3 as odid, 0 as flags, ?4 as data) "#;
+        let mut full = storage
+            .db
+            .prepare(&format!("{row}{}", include_str!("get_card.sql")))?;
+        let mut narrow = storage
+            .db
+            .prepare(&format!("{row}{}", include_str!("get_due_card_state.sql")))?;
+        for queue in [1, 2, 3, 4] {
+            for due in [
+                rusqlite::types::Value::Integer(100),
+                rusqlite::types::Value::Real(100.5),
+            ] {
+                for original_deck in [0, 45] {
+                    for data in [
+                        r#"{"s":30,"s_int":40,"s_fast":0.25,"d":6,"dr":0.85,"lrt":123456,"cd":"{\"x\":1}"}"#,
+                        r#"{"s":30,"d":6}"#,
+                        r#"{"s":30,"s_int":"bad","s_fast":[],"d":6,"dr":"bad","lrt":{}}"#,
+                        r#"{"s":"bad","d":6}"#,
+                        r#"{"s":30,"d":6,"cd":42}"#,
+                        "not json",
+                        "",
+                    ] {
+                        let params = params![queue, due, original_deck, data];
+                        let card = full.query_row(params, row_to_card)?;
+                        let candidate = narrow.query_row(params, row_to_due_card_with_state)?;
+                        assert_eq!(candidate, DueCardWithState::from(&card), "{data}");
+                        assert_eq!(candidate.interval, 12);
+                        assert_eq!(candidate.card.mtime, TimestampSecs(1234));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn due_cards_with_state_respects_queue_cutoffs_and_active_decks() -> crate::error::Result<()> {
+        use crate::scheduler::timing::SchedTimingToday;
+
+        let mut col = Collection::new();
+        let active = col.get_or_create_normal_deck("Active")?;
+        let child = col.get_or_create_normal_deck("Active::Child")?;
+        let inactive = col.get_or_create_normal_deck("Inactive")?;
+        let timing = SchedTimingToday {
+            now: TimestampSecs(1_000_000),
+            next_day_at: TimestampSecs(1_010_000),
+            days_elapsed: 100,
+        };
+        let mut expected = Vec::new();
+        for deck in [&active, &child, &inactive] {
+            for (queue, cutoff) in [
+                (CardQueue::Review, 100),
+                (CardQueue::DayLearn, 100),
+                (CardQueue::Learn, 1_000_000),
+                (CardQueue::PreviewRepeat, 1_000_000),
+                (CardQueue::New, 0),
+                (CardQueue::Suspended, 0),
+                (CardQueue::SchedBuried, 0),
+                (CardQueue::UserBuried, 0),
+            ] {
+                for offset in [-1, 0, 1] {
+                    let mut card = Card {
+                        deck_id: deck.id,
+                        queue,
+                        due: cutoff + offset,
+                        ..Default::default()
+                    };
+                    col.add_card(&mut card)?;
+                    if deck.id != inactive.id && cutoff != 0 && offset <= 0 {
+                        expected.push((deck.id, queue as i8, card.due));
+                    }
+                }
+            }
+        }
+        col.storage.update_active_decks(&active)?;
+        let mut actual = col
+            .storage
+            .due_cards_with_state_in_active_decks(timing)?
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.card.current_deck_id,
+                    candidate.queue as i8,
+                    candidate.card.due,
+                )
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        Ok(())
     }
 
     #[test]

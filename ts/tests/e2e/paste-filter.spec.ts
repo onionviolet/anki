@@ -46,6 +46,7 @@ test("<p> tags in pasted HTML are converted to <div> by the TS filter", async ({
     await pasteData(field, {
         "text/html": "<p>Paragraph One</p><p>Paragraph Two</p>",
     });
+    await expect(field).toContainText("Paragraph Two");
 
     // Filter must have rewritten <p> → <div> (element.ts:37-41, convertToDiv).
     const innerHTML = await field.evaluate((el) => el.innerHTML);

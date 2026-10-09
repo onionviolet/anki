@@ -5,22 +5,29 @@ import argparse
 import os
 import shutil
 import sys
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from tools.build_installer import (
+    PORTABLE_BUNDLE,
+    PORTABLE_DATA_DIR,
+    PORTABLE_FORMAL_NAME,
+    PORTABLE_MARKER,
     _find_fcitx_file,
     build,
     bundle_fcitx,
-    export_constraints,
+    compile_sources,
+    get_artifact_version,
     get_briefcase_config_args,
     get_briefcase_environ,
     get_briefcase_output_format,
     get_briefcase_sources_path,
     get_briefcase_template_path,
     get_platform_suffix,
+    get_portable_archive_path,
     get_signing_args,
     get_support_hash_args,
     get_uv_binary,
@@ -28,6 +35,8 @@ from tools.build_installer import (
     main,
     normalize_wheel_path,
     package,
+    package_portable_archive,
+    repair_macos_anki_audio_layout,
 )
 
 support_dir = Path(__file__).parent / "support"
@@ -37,6 +46,7 @@ dummy_wheel_path = support_dir / "dummy_package-0.1.0-py3-none-any.whl"
 @pytest.fixture
 def out_dir(tmp_path, monkeypatch) -> Path:
     monkeypatch.setattr("tools.build_installer.out_dir", tmp_path)
+    monkeypatch.setattr("tools.build_installer.portable_out_dir", tmp_path / "portable")
     shutil.copy(dummy_wheel_path, tmp_path / dummy_wheel_path.name)
     return tmp_path
 
@@ -53,7 +63,7 @@ def build_args(wheel_path: Path) -> dict[str, Any]:
 @pytest.fixture
 def cmd_args(wheel_path: Path) -> argparse.Namespace:
     version = "0.0.1"
-    return argparse.Namespace(version=version, **build_args(wheel_path))
+    return argparse.Namespace(version=version, portable=False, **build_args(wheel_path))
 
 
 @pytest.fixture
@@ -120,6 +130,21 @@ def test_sources_path(monkeypatch, tmp_path: Path, platform: str, root: str) -> 
     assert sources_path.name == root
 
 
+def test_portable_sources_path(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("sys.platform", "darwin")
+    sources_path = get_briefcase_sources_path(tmp_path, portable=True)
+    assert sources_path == (
+        tmp_path
+        / "build"
+        / "anki"
+        / "macos"
+        / "app"
+        / f"{PORTABLE_FORMAL_NAME}.app"
+        / "Contents"
+        / "Resources"
+    )
+
+
 @pytest.mark.parametrize(
     "platform, output_format",
     [("linux", ["linux", "zip"]), ("win32", ["windows", "visualstudio"])],
@@ -138,40 +163,6 @@ def test_briefcase_config(out_dir: Path, cmd_args: argparse.Namespace) -> None:
     )
     assert any(s.startswith("template=") for s in config)
     assert any(s.startswith('support_package_hash="sha256:') for s in config)
-    assert not any(s.startswith("requirement_installer_args=") for s in config)
-
-
-def test_briefcase_config_constraints(
-    out_dir: Path, cmd_args: argparse.Namespace
-) -> None:
-    constraints_path = out_dir / "constraints.txt"
-    config = get_briefcase_config_args(cmd_args, constraints_path)
-    assert (
-        f'requirement_installer_args=["--constraints","{normalize_wheel_path(constraints_path)}"]'
-        in config
-    )
-
-
-def test_export_constraints_command(mocker, monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("UV_BINARY", "uv-bin")
-    check_call = mocker.patch("tools.build_installer.subprocess.check_call")
-    assert export_constraints(tmp_path) == tmp_path / "constraints.txt"
-    cmd = check_call.call_args.args[0]
-    assert cmd[:3] == ["uv-bin", "export", "--frozen"]
-    assert cmd[-2:] == ["--output-file", str(tmp_path / "constraints.txt")]
-    assert "--no-emit-workspace" in cmd
-    for package in ("aqt", "anki"):
-        assert package in cmd[cmd.index("--package") :]
-
-
-def test_export_constraints_pins_lockfile(tmp_path: Path) -> None:
-    lines = export_constraints(tmp_path).read_text(encoding="utf-8").splitlines()
-    assert lines
-    for line in lines:
-        assert "==" in line and not line.startswith(("-e", "#"))
-    names = {line.split("==")[0] for line in lines}
-    assert {"flask", "protobuf", "pyqt6"} <= names
-    assert not {"anki", "aqt"} & names
 
 
 @pytest.mark.parametrize(
@@ -209,6 +200,14 @@ def test_support_hash_args_python_mismatch(monkeypatch) -> None:
         get_support_hash_args()
 
 
+def test_portable_briefcase_config(cmd_args: argparse.Namespace) -> None:
+    cmd_args.portable = True
+    config = get_briefcase_config_args(cmd_args)
+    assert f'formal_name="{PORTABLE_FORMAL_NAME}"' in config
+    assert f'bundle="{PORTABLE_BUNDLE}"' in config
+    assert "document_type={}" in config
+
+
 def test_compile_fails_loudly(
     mocker, out_dir: Path, cmd_args: argparse.Namespace
 ) -> None:
@@ -217,11 +216,42 @@ def test_compile_fails_loudly(
         build(cmd_args)
 
 
+def test_compile_keeps_chinese_support_source_for_profile_install(
+    monkeypatch, tmp_path: Path
+) -> None:
+    sources = tmp_path / "sources"
+    vendor = sources / "app_packages" / "aqt" / "weibao" / "chinese_support_vendor"
+    vendor.mkdir(parents=True)
+    (sources / "app").mkdir()
+    (vendor / "__init__.py").write_text("VALUE = 1\n")
+    ordinary = sources / "app_packages" / "ordinary.py"
+    ordinary.write_text("VALUE = 2\n")
+    monkeypatch.setattr(
+        "tools.build_installer.get_briefcase_sources_path", lambda *_a, **_k: sources
+    )
+
+    assert compile_sources(tmp_path, "0.0.1")
+    assert (vendor / "__init__.py").is_file()
+    assert (vendor / "__init__.pyc").is_file()
+    assert not ordinary.exists()
+    assert ordinary.with_suffix(".pyc").is_file()
+
+
 def test_signing_args(monkeypatch) -> None:
     monkeypatch.setenv("SIGN_IDENTITY", "")
     assert get_signing_args() == ["--adhoc-sign"]
     monkeypatch.setenv("SIGN_IDENTITY", "foo")
     assert get_signing_args() == ["--identity", "foo"]
+
+
+def test_artifact_version_defaults_to_app_version(monkeypatch) -> None:
+    monkeypatch.delenv("ANKI_ARTIFACT_VERSION", raising=False)
+    assert get_artifact_version("26.09b1+fsrs7") == "26.09b1+fsrs7"
+
+
+def test_artifact_version_can_include_release_build(monkeypatch) -> None:
+    monkeypatch.setenv("ANKI_ARTIFACT_VERSION", "26.09b1+fsrs7.build.85")
+    assert get_artifact_version("26.09b1+fsrs7") == "26.09b1+fsrs7.build.85"
 
 
 @pytest.mark.parametrize(
@@ -265,6 +295,23 @@ def test_main(mocker, wheel_path: Path) -> None:
     package_mock = mocker.patch("tools.build_installer.package")
     args = main([*version_args, "package"])
     package_mock.assert_called_once_with(args)
+
+
+@pytest.mark.parametrize("platform", ["darwin", "win32", "linux"])
+def test_main_portable(monkeypatch, mocker, wheel_path: Path, platform: str) -> None:
+    monkeypatch.setattr("sys.platform", platform)
+    build_mock = mocker.patch("tools.build_installer.build")
+    args = main(
+        [
+            "--version",
+            "0.0.1",
+            "--portable",
+            "build",
+            *_to_cmd_list(build_args(wheel_path)),
+        ]
+    )
+    assert args.portable
+    build_mock.assert_called_once_with(args)
 
 
 def test_find_fcitx_file_returns_match(tmp_path: Path) -> None:
@@ -315,6 +362,174 @@ def test_bundle_fcitx_skipped_if_not_linux(
         mock.assert_called_once()
     else:
         mock.assert_not_called()
+
+
+def test_repair_macos_anki_audio_layout_renames_lib_to_libs(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("sys.platform", "darwin")
+    audio_dir = get_briefcase_sources_path(tmp_path) / "app_packages" / "anki_audio"
+    lib_dir = audio_dir / "lib"
+    lib_dir.mkdir(parents=True)
+    (lib_dir / "libass.9.dylib").touch()
+
+    repair_macos_anki_audio_layout(tmp_path)
+
+    assert (audio_dir / "libs" / "libass.9.dylib").exists()
+    assert not lib_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "platform, machine, filename",
+    [
+        ("darwin", "arm64", "anki-0.0.1-portable-mac-apple.zip"),
+        ("win32", "AMD64", "anki-0.0.1-portable-win-x64.zip"),
+        ("linux", "x86_64", "anki-0.0.1-portable-linux-x86_64.tar.zst"),
+    ],
+)
+def test_portable_archive_path(
+    monkeypatch,
+    tmp_path: Path,
+    platform: str,
+    machine: str,
+    filename: str,
+) -> None:
+    monkeypatch.setattr("sys.platform", platform)
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    assert get_portable_archive_path(tmp_path, "0.0.1") == (
+        tmp_path / "dist" / filename
+    )
+
+
+def test_package_portable_archive_macos(monkeypatch, mocker, tmp_path: Path) -> None:
+    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    resources = get_briefcase_sources_path(tmp_path, portable=True)
+    resources.mkdir(parents=True)
+    (resources / PORTABLE_MARKER).touch()
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    generated_dmg = dist_dir / "generated.dmg"
+    generated_dmg.touch()
+
+    def create_archive(command: list[str]) -> None:
+        Path(command[-1]).touch()
+
+    ditto = mocker.patch("subprocess.check_call", side_effect=create_archive)
+    archive = package_portable_archive(tmp_path, "0.0.1")
+
+    assert archive == dist_dir / "anki-0.0.1-portable-mac-apple.zip"
+    assert archive.exists()
+    assert not generated_dmg.exists()
+    assert not (tmp_path / "portable-package").exists()
+    assert ditto.call_args.args[0][:5] == [
+        "ditto",
+        "-c",
+        "-k",
+        "--sequesterRsrc",
+        "--keepParent",
+    ]
+    assert PORTABLE_DATA_DIR in (installer_dir / "portable-readme.txt").read_text()
+
+
+def test_package_portable_archive_windows(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr("platform.machine", lambda: "AMD64")
+    sources = get_briefcase_sources_path(tmp_path, portable=True)
+    sources.mkdir(parents=True)
+    (sources / PORTABLE_MARKER).touch()
+    (sources / f"{PORTABLE_FORMAL_NAME}.exe").touch()
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    generated_msi = dist_dir / "generated.msi"
+    generated_msi.touch()
+
+    archive = package_portable_archive(tmp_path, "0.0.1")
+
+    assert archive == dist_dir / "anki-0.0.1-portable-win-x64.zip"
+    assert archive.exists()
+    assert not generated_msi.exists()
+    assert not (tmp_path / "portable-package").exists()
+    with zipfile.ZipFile(archive) as portable_zip:
+        names = set(portable_zip.namelist())
+    assert f"{PORTABLE_FORMAL_NAME}/{PORTABLE_MARKER}" in names
+    assert f"{PORTABLE_FORMAL_NAME}/{PORTABLE_DATA_DIR}/" in names
+    assert f"{PORTABLE_FORMAL_NAME}/README.txt" in names
+
+
+def test_package_portable_archive_linux(monkeypatch, mocker, tmp_path: Path) -> None:
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setattr("platform.machine", lambda: "aarch64")
+    sources = get_briefcase_sources_path(tmp_path, portable=True)
+    sources.mkdir(parents=True)
+    (sources / PORTABLE_MARKER).touch()
+    (sources / "anki").touch()
+
+    def create_archive(command: list[str]) -> None:
+        distribution_dir = tmp_path / "portable-package" / PORTABLE_FORMAL_NAME
+        assert (distribution_dir / PORTABLE_MARKER).exists()
+        assert (distribution_dir / PORTABLE_DATA_DIR).is_dir()
+        Path(command[4]).touch()
+
+    tar = mocker.patch("subprocess.check_call", side_effect=create_archive)
+    archive = package_portable_archive(tmp_path, "0.0.1")
+
+    assert archive == (tmp_path / "dist/anki-0.0.1-portable-linux-aarch64.tar.zst")
+    assert archive.exists()
+    assert not (tmp_path / "portable-package").exists()
+    assert tar.call_args.args[0][0] == "tar"
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_package_portable_skips_native_installer(
+    monkeypatch, mocker, tmp_path: Path, platform: str
+) -> None:
+    monkeypatch.setattr("sys.platform", platform)
+    monkeypatch.setattr("tools.build_installer.portable_out_dir", tmp_path)
+    archive = mocker.patch("tools.build_installer.package_portable_archive")
+    briefcase = mocker.patch("subprocess.check_call")
+    args = argparse.Namespace(version="0.0.1", portable=True)
+
+    package(args)
+
+    archive.assert_called_once_with(tmp_path, "0.0.1")
+    briefcase.assert_not_called()
+
+
+def test_package_portable_uses_artifact_version(
+    monkeypatch, mocker, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setattr("tools.build_installer.portable_out_dir", tmp_path)
+    monkeypatch.setenv("ANKI_ARTIFACT_VERSION", "26.09b1+fsrs7.build.85")
+    archive = mocker.patch("tools.build_installer.package_portable_archive")
+    args = argparse.Namespace(version="26.09b1+fsrs7", portable=True)
+
+    package(args)
+
+    archive.assert_called_once_with(tmp_path, "26.09b1+fsrs7.build.85")
+
+
+def test_package_installer_uses_artifact_version(
+    monkeypatch, mocker, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    monkeypatch.setattr("tools.build_installer.out_dir", tmp_path)
+    monkeypatch.setenv("ANKI_ARTIFACT_VERSION", "26.09b1+fsrs7.build.85")
+    mocker.patch("tools.build_installer.get_briefcase_environ", return_value={})
+
+    def create_package(*_args, **_kwargs) -> None:
+        dist_dir = tmp_path / "dist"
+        dist_dir.mkdir()
+        (dist_dir / "generated.dmg").touch()
+
+    mocker.patch("subprocess.check_call", side_effect=create_package)
+    args = argparse.Namespace(version="26.09b1+fsrs7", portable=False)
+
+    package(args)
+
+    assert (tmp_path / "dist/anki-26.09b1+fsrs7.build.85-mac-apple.dmg").exists()
 
 
 def test_build_and_package(out_dir: Path, cmd_args: argparse.Namespace) -> None:

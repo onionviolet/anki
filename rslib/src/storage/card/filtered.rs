@@ -281,6 +281,8 @@ mod test {
             card.memory_state = Some(FsrsMemoryState {
                 stability,
                 difficulty: 5.0,
+                stability_fast: None,
+                stability_internal: stability,
             });
             card.last_review_time = Some(TimestampSecs(NOW - 10 * 86_400));
             card.desired_retention = Some(0.9);

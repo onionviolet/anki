@@ -16,6 +16,10 @@ import "anki/deck_config.proto";
 
 service SchedulerService {
   rpc GetQueuedCards(GetQueuedCardsRequest) returns (QueuedCards);
+  // Rebuilds and retains the queue while treating the supplied card as already
+  // displayed, and returns the resulting counts without fetching another card.
+  rpc RebuildQueuedCardsPreservingCurrentCard(cards.CardId)
+      returns (QueuedCards);
   rpc AnswerCard(CardAnswer) returns (collection.OpChanges);
   rpc SchedTimingToday(generic.Empty) returns (SchedTimingTodayResponse);
   rpc StudiedToday(generic.Empty) returns (generic.String);
@@ -40,6 +44,8 @@ service SchedulerService {
   rpc SortCards(SortCardsRequest) returns (collection.OpChangesWithCount);
   rpc SortDeck(SortDeckRequest) returns (collection.OpChangesWithCount);
   rpc GetSchedulingStates(cards.CardId) returns (SchedulingStates);
+  rpc GetSchedulingStatesWithOpts(GetSchedulingStatesRequest)
+      returns (SchedulingStates);
   rpc DescribeNextStates(SchedulingStates) returns (generic.StringList);
   rpc StateIsLeech(SchedulingState) returns (generic.Bool);
   rpc UpgradeScheduler(generic.Empty) returns (generic.Empty);
@@ -49,6 +55,11 @@ service SchedulerService {
   rpc RepositionDefaults(generic.Empty) returns (RepositionDefaultsResponse);
   rpc ComputeFsrsParams(ComputeFsrsParamsRequest)
       returns (ComputeFsrsParamsResponse);
+  rpc ComputeFsrsParamsBatch(ComputeFsrsParamsBatchRequest)
+      returns (ComputeFsrsParamsBatchResponse);
+  rpc ComputeFsrsReviewRetrievabilityCalibration(
+      ComputeFsrsReviewRetrievabilityCalibrationRequest)
+      returns (generic.UInt32);
   rpc GetOptimalRetentionParameters(GetOptimalRetentionParametersRequest)
       returns (GetOptimalRetentionParametersResponse);
   rpc ComputeOptimalRetention(SimulateFsrsReviewRequest)
@@ -57,13 +68,88 @@ service SchedulerService {
       returns (SimulateFsrsReviewResponse);
   rpc SimulateFsrsWorkload(SimulateFsrsReviewRequest)
       returns (SimulateFsrsWorkloadResponse);
+  rpc GetFsrsNewCardIntervals(GetFsrsNewCardIntervalsRequest)
+      returns (generic.StringList);
   rpc EvaluateParams(EvaluateParamsRequest) returns (EvaluateParamsResponse);
   rpc EvaluateParamsLegacy(EvaluateParamsLegacyRequest)
       returns (EvaluateParamsResponse);
   rpc ComputeMemoryState(cards.CardId) returns (ComputeMemoryStateResponse);
+  rpc GetFsrsPresetForCard(cards.CardId) returns (FsrsPresetForCardResponse);
   // The number of days the calculated interval was fuzzed by on the previous
   // review (if any). Utilized by the FSRS add-on.
   rpc FuzzDelta(FuzzDeltaRequest) returns (FuzzDeltaResponse);
+  // Build answer states after replacing any supplied intervals with
+  // unrounded day values from an external scheduler such as RWKV-Curve.
+  rpc SchedulingStatesWithIntervals(SchedulingStatesWithIntervalsRequest)
+      returns (SchedulingStates);
+  // Helper APIs for add-ons that need scheduler-accurate FSRS math.
+  rpc FsrsCurrentRetrievability(FsrsCurrentRetrievabilityRequest)
+      returns (FsrsCurrentRetrievabilityResponse);
+  rpc FsrsNextInterval(FsrsNextIntervalRequest)
+      returns (FsrsNextIntervalResponse);
+  rpc FsrsIntervalAtRetrievability(FsrsIntervalAtRetrievabilityRequest)
+      returns (FsrsIntervalAtRetrievabilityResponse);
+  rpc FsrsIntervalAtRetrievabilityBatch(
+      FsrsIntervalAtRetrievabilityBatchRequest)
+      returns (FsrsIntervalAtRetrievabilityBatchResponse);
+  rpc FsrsIntervalAtRetrievabilityVariableBatch(
+      FsrsIntervalAtRetrievabilityVariableBatchRequest)
+      returns (FsrsIntervalAtRetrievabilityVariableBatchResponse);
+  rpc FsrsDesiredRetentionForIntervalsBatch(
+      FsrsDesiredRetentionForIntervalsBatchRequest)
+      returns (FsrsDesiredRetentionForIntervalsBatchResponse);
+  rpc FsrsIntervalAtRetrievabilityByConfigBatch(
+      FsrsIntervalAtRetrievabilityByConfigBatchRequest)
+      returns (FsrsIntervalAtRetrievabilityByConfigBatchResponse);
+  // Installs a transient desktop-only RWKV retrievability map used by review
+  // queue ordering. Empty scores clear the map.
+  rpc SetRwkvReviewQueueScores(RwkvReviewQueueScoresRequest)
+      returns (generic.Empty);
+  // Updates or removes one already-answered card's transient queue score
+  // without invalidating the retained queue behind it.
+  rpc PatchAnsweredCardRwkvReviewQueueScore(
+      RwkvAnsweredCardQueueScorePatchRequest) returns (generic.Empty);
+  // Incrementally installs transient desktop-only RWKV score maps used only
+  // while rendering deck-browser counts. Each request replaces one disjoint
+  // deck scope; ClearRwkvDeckCountScores removes every scope.
+  rpc SetRwkvDeckCountScores(RwkvReviewQueueScoresRequest)
+      returns (generic.Empty);
+  rpc ClearRwkvDeckCountScores(generic.Empty) returns (generic.Empty);
+  // Updates session-local repeat-spacing metadata on the active transient RWKV
+  // review queue map without replacing retrievability scores.
+  rpc UpdateRwkvReviewQueueInterveningReviews(
+      RwkvReviewQueueInterveningReviewsRequest) returns (generic.Empty);
+  // Installs a transient desktop-only RWKV retrievability map used by stats
+  // graphs. Scores are scoped to the supplied search.
+  rpc SetRwkvStatsGraphScores(RwkvStatsGraphScoresRequest)
+      returns (generic.Empty);
+  // Installs or clears a transient desktop-only RWKV retrievability score
+  // computed while rendering card info.
+  rpc SetRwkvCardInfoScore(RwkvCardInfoScoreRequest) returns (generic.Empty);
+  // Returns the active transient desktop-only RWKV retrievability score for a
+  // card, if one has been installed for the current scheduler day.
+  rpc GetRwkvRetrievabilityScore(cards.CardId)
+      returns (RwkvRetrievabilityScoreResponse);
+  // Stores derived local RWKV review-time retrievability cache rows.
+  rpc SetRwkvReviewRetrievabilityCacheRows(
+      RwkvReviewRetrievabilityCacheRowsRequest) returns (generic.UInt32);
+  // Applies desktop-computed RWKV reschedule intervals and S90 values.
+  rpc ApplyRwkvReviewReschedule(RwkvReviewRescheduleRequest)
+      returns (collection.OpChangesWithCount);
+  rpc RwkvReviewInputRowsForCards(RwkvReviewInputRowsForCardsRequest)
+      returns (RwkvReviewInputRowsForCardsResponse);
+  rpc RwkvReviewInputRowsForSearch(RwkvReviewInputRowsForSearchRequest)
+      returns (RwkvReviewInputRowsForCardsResponse);
+  rpc RwkvReviewInputRowsForDeckReviewQueue(
+      RwkvReviewInputRowsForDeckReviewQueueRequest)
+      returns (RwkvReviewInputRowsForCardsResponse);
+  rpc GetFsrsPresetIdsForCards(cards.CardIds)
+      returns (FsrsPresetIdsForCardsResponse);
+  // Computes the canonical RWKV history identity inside the collection
+  // backend, avoiding a full revlog transfer through Python when validating a
+  // persisted state cache.
+  rpc RwkvHistoricalReviewFingerprint(RwkvHistoricalReviewFingerprintRequest)
+      returns (RwkvHistoricalReviewFingerprintResponse);
 }
 
 // Implicitly includes any of the above methods that are not listed in the
@@ -94,6 +180,7 @@ message SchedulingState {
     uint32 lapses = 4;
     bool leeched = 5;
     optional cards.FsrsMemoryState memory_state = 6;
+    sint32 fuzz_delta_days = 7;
   }
   message Relearning {
     Review review = 1;
@@ -153,6 +240,12 @@ message QueuedCards {
 message GetQueuedCardsRequest {
   uint32 fetch_limit = 1;
   bool intraday_learning_only = 2;
+  bool skip_scheduling_states = 3;
+}
+
+message GetSchedulingStatesRequest {
+  int64 card_id = 1;
+  optional float desired_retention_override = 2;
 }
 
 message SchedTimingTodayResponse {
@@ -244,8 +337,15 @@ message SetDueDateRequest {
 }
 
 message GradeNowRequest {
+  message CardOptions {
+    int64 card_id = 1;
+    optional float desired_retention_override = 2;
+    optional SchedulingStates scheduling_states = 3;
+  }
+
   repeated int64 card_ids = 1;
   CardAnswer.Rating rating = 2;
+  repeated CardOptions card_options = 3;
 }
 
 message SortCardsRequest {
@@ -267,6 +367,8 @@ message SchedulingStates {
   SchedulingState hard = 3;
   SchedulingState good = 4;
   SchedulingState easy = 5;
+  repeated float dynamic_desired_retentions = 6;
+  bool dynamic_desired_retention_enabled = 7;
 }
 
 message CardAnswer {
@@ -283,6 +385,12 @@ message CardAnswer {
   Rating rating = 4;
   int64 answered_at_millis = 5;
   uint32 milliseconds_taken = 6;
+  optional float desired_retention_override = 7;
+  optional float rwkv_s90 = 8;
+  optional float rwkv_retrievability = 9;
+  // Raw revlog kind selected by RWKV's synthetic same-day state machine.
+  // Only Learning through Filtered (0-3) are accepted by the backend.
+  optional uint32 rwkv_review_kind = 10;
 }
 
 message CustomStudyRequest {
@@ -361,12 +469,79 @@ message ComputeFsrsParamsRequest {
   int64 ignore_revlogs_before_ms = 3;
   uint32 num_of_relearning_steps = 4;
   bool health_check = 5;
+  optional bool include_same_day_reviews = 6;
+  optional deck_config.DeckConfig.Config.FsrsVersion fsrs_version = 7;
+  bool dynamic_desired_retention_enabled = 8;
+  optional uint32 dynamic_desired_retention_review_limit = 9;
+  optional float dynamic_desired_retention_max_cost_perday_minutes = 10;
+  optional bool enable_scheduling_penalties = 11;
 }
 
 message ComputeFsrsParamsResponse {
   repeated float params = 1;
   uint32 fsrs_items = 2;
   optional bool health_check_passed = 3;
+  repeated float fsrs_dynamic_desired_retention_params = 4;
+  repeated float fsrs_dynamic_desired_retention_weights = 5;
+  repeated float fsrs_dynamic_desired_retention_avg_drs = 6;
+  float fsrs_dynamic_desired_retention_min = 7;
+  float fsrs_dynamic_desired_retention_max = 8;
+  repeated float fsrs_dynamic_desired_retention_fsrs_eq_weights = 9;
+  repeated float fsrs_dynamic_desired_retention_fsrs_eq_drs = 10;
+  repeated float fsrs_dynamic_desired_retention_fixed_target_weights = 11;
+  repeated float fsrs_dynamic_desired_retention_fixed_target_drs = 12;
+}
+
+message ComputeFsrsParamsBatchRequest {
+  message Item {
+    string id = 1;
+    string name = 2;
+    /// The search used to gather cards for training
+    string search = 3;
+    repeated float current_params = 4;
+    int64 ignore_revlogs_before_ms = 5;
+    uint32 num_of_relearning_steps = 6;
+    optional bool include_same_day_reviews = 7;
+    optional deck_config.DeckConfig.Config.FsrsVersion fsrs_version = 8;
+    bool dynamic_desired_retention_enabled = 9;
+    optional uint32 dynamic_desired_retention_review_limit = 10;
+    optional float dynamic_desired_retention_max_cost_perday_minutes = 11;
+    optional bool enable_scheduling_penalties = 12;
+  }
+
+  repeated Item items = 1;
+}
+
+message ComputeFsrsParamsBatchResponse {
+  message Item {
+    string id = 1;
+    string name = 2;
+    repeated float params = 3;
+    uint32 fsrs_items = 4;
+    repeated float fsrs_dynamic_desired_retention_params = 5;
+    repeated float fsrs_dynamic_desired_retention_weights = 6;
+    repeated float fsrs_dynamic_desired_retention_avg_drs = 7;
+    float fsrs_dynamic_desired_retention_min = 8;
+    float fsrs_dynamic_desired_retention_max = 9;
+    repeated float fsrs_dynamic_desired_retention_fsrs_eq_weights = 10;
+    repeated float fsrs_dynamic_desired_retention_fsrs_eq_drs = 11;
+    repeated float fsrs_dynamic_desired_retention_fixed_target_weights = 12;
+    repeated float fsrs_dynamic_desired_retention_fixed_target_drs = 13;
+  }
+
+  repeated Item items = 1;
+}
+
+message ComputeFsrsReviewRetrievabilityCalibrationRequest {
+  /// The search used to gather cards for calibration
+  string search = 1;
+  repeated float params = 2;
+  int64 ignore_revlogs_before_ms = 3;
+  uint32 num_of_relearning_steps = 4;
+  optional bool include_same_day_reviews = 5;
+  optional deck_config.DeckConfig.Config.FsrsVersion fsrs_version = 6;
+  bool include_validation_folds = 7;
+  optional bool enable_scheduling_penalties = 8;
 }
 
 message ComputeFsrsParamsFromItemsRequest {
@@ -411,6 +586,28 @@ message SimulateFsrsReviewRequest {
   float historical_retention = 13;
   uint32 learning_step_count = 14;
   uint32 relearning_step_count = 15;
+  optional float review_fuzz_base = 16;
+  optional float review_fuzz_factor_short = 17;
+  optional float review_fuzz_factor_mid = 18;
+  optional float review_fuzz_factor_long = 19;
+  optional float help_me_decide_transition_blend_alpha = 21;
+  optional bool help_me_decide_enforce_monotonic_success_grade_probs = 22;
+  bool simulate_dynamic_desired_retention = 23;
+  repeated float fsrs_dynamic_desired_retention_params = 24;
+  repeated float fsrs_dynamic_desired_retention_weights = 25;
+  repeated float fsrs_dynamic_desired_retention_avg_drs = 26;
+  float fsrs_dynamic_desired_retention_min = 27;
+  float fsrs_dynamic_desired_retention_max = 28;
+  repeated float fsrs_dynamic_desired_retention_fsrs_eq_weights = 29;
+  repeated float fsrs_dynamic_desired_retention_fsrs_eq_drs = 30;
+  bool fsrs_dynamic_desired_retention_clamp = 31;
+  repeated float fsrs_dynamic_desired_retention_fixed_target_weights = 32;
+  repeated float fsrs_dynamic_desired_retention_fixed_target_drs = 33;
+  bool split_workload_by_preset = 34;
+  string workload_preset_label = 35;
+  uint32 rwkv_workload_sample_limit = 36;
+  uint32 rwkv_workload_target_step = 37;
+  uint32 rwkv_workload_state_update_interval = 38;
 }
 
 message SimulateFsrsReviewResponse {
@@ -425,6 +622,42 @@ message SimulateFsrsWorkloadResponse {
   float reviewless_end_memorized = 2;
   map<uint32, float> memorized = 3;
   map<uint32, uint32> review_count = 4;
+  uint32 review_time_r_bucket_count = 5;
+  uint32 review_time_s_bucket_count = 6;
+  repeated float review_time_again_seconds = 7;
+  repeated float review_time_hard_seconds = 8;
+  repeated uint32 review_time_sample_counts = 9;
+  repeated float review_time_again_coeffs = 10;
+  repeated float review_time_hard_coeffs = 11;
+  repeated float review_time_good_seconds = 12;
+  repeated float review_time_easy_seconds = 13;
+  repeated float review_time_good_coeffs = 14;
+  repeated float review_time_easy_coeffs = 15;
+  repeated float review_time_grade_weights = 16;
+  repeated float review_time_transition_probs = 17;
+  repeated uint32 review_time_transition_counts = 18;
+  repeated float review_time_success_grade_probs = 19;
+  repeated uint32 review_time_success_grade_counts = 20;
+  // Sum of end-of-simulation retrievability weighted by stability, using
+  // 1 - exp((-8 / 365) * S).
+  map<uint32, float> weighted_memorized = 21;
+  float reviewless_end_weighted_memorized = 22;
+  repeated SimulateFsrsPresetWorkload preset_workload = 23;
+}
+
+message SimulateFsrsPresetWorkload {
+  string name = 1;
+  map<uint32, float> cost = 2;
+  map<uint32, uint32> review_count = 3;
+  map<uint32, uint32> learn_count = 4;
+  // End-of-simulation card memorized values attributed to the card's final
+  // active preset.
+  map<uint32, float> memorized = 5;
+  map<uint32, float> weighted_memorized = 6;
+  // Reviewless end-of-simulation baselines attributed to the card's active
+  // preset before simulated reviews.
+  map<uint32, float> reviewless_end_memorized = 7;
+  map<uint32, float> reviewless_end_weighted_memorized = 8;
 }
 
 message ComputeOptimalRetentionResponse {
@@ -456,12 +689,24 @@ message EvaluateParamsRequest {
   string search = 1;
   int64 ignore_revlogs_before_ms = 2;
   uint32 num_of_relearning_steps = 3;
+  deck_config.DeckConfig.Config.FsrsVersion fsrs_version = 4;
+  optional bool include_same_day_reviews = 5;
+  optional bool include_same_day_reviews_for_training = 6;
+  optional string search_for_training = 7;
+  optional bool enable_scheduling_penalties = 8;
+}
+
+message GetFsrsNewCardIntervalsRequest {
+  deck_config.DeckConfig.Config config = 1;
+  optional bool fsrs_short_term_with_steps_enabled = 2;
+  optional bool fsrs_learning_queues_disabled = 3;
 }
 
 message EvaluateParamsLegacyRequest {
   repeated float params = 1;
   string search = 2;
   int64 ignore_revlogs_before_ms = 3;
+  optional bool include_same_day_reviews = 4;
 }
 
 message EvaluateParamsResponse {
@@ -475,6 +720,66 @@ message ComputeMemoryStateResponse {
   float decay = 3;
 }
 
+message FsrsPresetForCardResponse {
+  string id = 1;
+  string name = 2;
+  deck_config.DeckConfig.Config.FsrsVersion fsrs_version = 3;
+  repeated float params = 4;
+  float desired_retention = 5;
+  float historical_retention = 6;
+  string ignore_revlogs_before_date = 7;
+  bool fsrs_dynamic_desired_retention_enabled = 8;
+  repeated float fsrs_dynamic_desired_retention_params = 9;
+  repeated float fsrs_dynamic_desired_retention_weights = 10;
+  repeated float fsrs_dynamic_desired_retention_avg_drs = 11;
+  float fsrs_dynamic_desired_retention_min = 12;
+  float fsrs_dynamic_desired_retention_max = 13;
+  repeated float fsrs_dynamic_desired_retention_fsrs_eq_weights = 14;
+  repeated float fsrs_dynamic_desired_retention_fsrs_eq_drs = 15;
+  bool fsrs_dynamic_desired_retention_clamp = 16;
+  repeated float fsrs_dynamic_desired_retention_fixed_target_weights = 17;
+  repeated float fsrs_dynamic_desired_retention_fixed_target_drs = 18;
+}
+
+message FsrsPresetIdsForCardsResponse {
+  message Item {
+    int64 card_id = 1;
+    string preset_id = 2;
+  }
+  repeated Item items = 1;
+}
+
+message RwkvHistoricalReviewFingerprintRequest {
+  repeated int64 ignored_review_ids = 1;
+  bool dynamic_preset_replay = 2;
+  // Add-on preset identifiers are hashed by the desktop with its persisted
+  // compatibility algorithm. Numeric deck-config identifiers need not be
+  // included.
+  map<string, int64> stable_preset_ids = 3;
+  // Supplied by the desktop so collections written before the fork's
+  // deck-config compatibility encoding retain their existing replay identity.
+  map<int64, bool> first_review_uses_creation_by_config_id = 4;
+  // When present, Rust compares the canonical history and verifies that every
+  // requested ignored review still belongs to the eligible history.
+  RwkvHistoricalReviewIdentity expected_identity = 5;
+}
+
+message RwkvHistoricalReviewIdentity {
+  int64 last_review_id = 1;
+  uint64 review_count = 2;
+  string history_hash = 3;
+}
+
+message RwkvHistoricalReviewFingerprintResponse {
+  int64 last_review_id = 1;
+  uint64 review_count = 2;
+  string history_hash = 3;
+  repeated int64 active_ignored_review_ids = 4;
+  uint64 queried_review_count = 5;
+  // False when expected_identity is absent.
+  bool history_is_valid = 6;
+}
+
 message FuzzDeltaRequest {
   int64 card_id = 1;
   uint32 interval = 2;
@@ -482,4 +787,236 @@ message FuzzDeltaRequest {
 
 message FuzzDeltaResponse {
   sint32 delta_days = 1;
+}
+
+message SchedulingStatesWithIntervalsRequest {
+  int64 card_id = 1;
+  optional float again = 2;
+  optional float hard = 3;
+  optional float good = 4;
+  optional float easy = 5;
+}
+
+message FsrsCurrentRetrievabilityRequest {
+  int64 card_id = 1;
+  float stability = 2;
+  float elapsed_days = 3;
+}
+
+message FsrsCurrentRetrievabilityResponse {
+  float retrievability = 1;
+}
+
+message FsrsNextIntervalRequest {
+  int64 card_id = 1;
+  float stability = 2;
+  float desired_retention = 3;
+}
+
+message FsrsNextIntervalResponse {
+  float interval = 1;
+}
+
+message FsrsIntervalAtRetrievabilityRequest {
+  int64 card_id = 1;
+  float stability = 2;
+  float target_retrievability = 3;
+}
+
+message FsrsIntervalAtRetrievabilityResponse {
+  float interval = 1;
+}
+
+message FsrsIntervalAtRetrievabilityBatchRequest {
+  message Item {
+    int64 card_id = 1;
+    float stability = 2;
+  }
+  repeated Item items = 1;
+  float target_retrievability = 2;
+}
+
+message FsrsIntervalAtRetrievabilityBatchResponse {
+  message Item {
+    int64 card_id = 1;
+    float interval = 2;
+  }
+  repeated Item items = 1;
+}
+
+message FsrsIntervalAtRetrievabilityVariableBatchRequest {
+  message Item {
+    uint32 request_index = 1;
+    int64 card_id = 2;
+    float stability = 3;
+    float target_retrievability = 4;
+  }
+  repeated Item items = 1;
+}
+
+message FsrsIntervalAtRetrievabilityVariableBatchResponse {
+  message Item {
+    uint32 request_index = 1;
+    float interval = 2;
+  }
+  repeated Item items = 1;
+}
+
+message FsrsDesiredRetentionForIntervalsBatchRequest {
+  message Item {
+    uint32 request_index = 1;
+    int64 card_id = 2;
+    float desired_retention = 3;
+  }
+  repeated Item items = 1;
+}
+
+message FsrsDesiredRetentionForIntervalsBatchResponse {
+  message Item {
+    uint32 request_index = 1;
+    float interval_target_desired_retention = 2;
+    repeated float dynamic_desired_retentions = 3;
+    bool dynamic_desired_retention_enabled = 4;
+  }
+  repeated Item items = 1;
+}
+
+message FsrsIntervalAtRetrievabilityByConfigBatchRequest {
+  message Item {
+    uint32 request_index = 1;
+    int64 config_id = 2;
+    float stability = 3;
+  }
+  repeated Item items = 1;
+  float target_retrievability = 2;
+}
+
+message FsrsIntervalAtRetrievabilityByConfigBatchResponse {
+  message Item {
+    uint32 request_index = 1;
+    float interval = 2;
+  }
+  repeated Item items = 1;
+}
+
+message RwkvReviewQueueScoresRequest {
+  message Score {
+    int64 card_id = 1;
+    float retrievability = 2;
+    optional uint32 intervening_reviews = 3;
+    optional float target_retention = 4;
+  }
+  int64 deck_id = 1;
+  repeated Score scores = 2;
+}
+
+message RwkvAnsweredCardQueueScorePatchRequest {
+  int64 deck_id = 1;
+  int64 card_id = 2;
+  optional RwkvReviewQueueScoresRequest.Score score = 3;
+}
+
+message RwkvReviewQueueInterveningReviewsRequest {
+  message Item {
+    int64 card_id = 1;
+    uint32 intervening_reviews = 2;
+  }
+  int64 deck_id = 1;
+  repeated Item items = 2;
+}
+
+message RwkvStatsGraphScoresRequest {
+  message Score {
+    int64 card_id = 1;
+    float retrievability = 2;
+    optional uint32 intervening_reviews = 3;
+    optional float target_retention = 4;
+    optional bool curve_due = 5;
+    optional float curve_retrievability = 6;
+  }
+  string search = 1;
+  repeated Score scores = 2;
+}
+
+message RwkvCardInfoScoreRequest {
+  int64 card_id = 1;
+  optional float retrievability = 2;
+  optional float curve_retrievability = 3;
+}
+
+message RwkvRetrievabilityScoreResponse {
+  optional float retrievability = 1;
+}
+
+message RwkvReviewRetrievabilityCacheRowsRequest {
+  message Row {
+    int64 revlog_id = 1;
+    float prediction = 2;
+    string sample_role = 3;
+    int32 fold_index = 4;
+  }
+  string source = 1;
+  repeated Row rows = 2;
+}
+
+message RwkvReviewRescheduleRequest {
+  message Item {
+    int64 card_id = 1;
+    uint32 interval_days = 2;
+    uint32 elapsed_days = 3;
+    float s90 = 4;
+    optional float target_retention = 5;
+  }
+  repeated Item items = 1;
+}
+
+message RwkvReviewInputRowsForCardsRequest {
+  repeated int64 card_ids = 1;
+  bool include_suspended_review = 2;
+  bool include_disabled_decks = 3;
+  bool include_new_cards = 4;
+}
+
+message RwkvReviewInputRowsForSearchRequest {
+  string search = 1;
+  bool include_suspended_review = 2;
+  bool include_disabled_decks = 3;
+  bool include_new_cards = 4;
+}
+
+message RwkvReviewInputRowsForDeckReviewQueueRequest {
+  int64 deck_id = 1;
+  bool include_disabled_decks = 2;
+  bool include_new_cards = 3;
+}
+
+message RwkvReviewInputRowsForCardsResponse {
+  message Row {
+    int64 card_id = 1;
+    int64 note_id = 2;
+    int64 deck_id = 3;
+    string preset_id = 4;
+    sint32 card_type = 5;
+    sint32 card_queue = 6;
+    sint32 card_due = 7;
+    uint32 interval_days = 8;
+    uint32 ease_factor = 9;
+    uint32 reps = 10;
+    uint32 lapses = 11;
+    uint32 day_offset = 12;
+    string current_state_kind = 13;
+    string current_normal_state_kind = 14;
+    optional uint32 current_elapsed_days = 15;
+    optional uint32 current_elapsed_seconds = 16;
+    float target_retention = 17;
+    uint32 batch_size = 18;
+    optional bool enforce_grade_order = 19;
+  }
+
+  repeated Row rows = 1;
+  uint32 loaded_cards = 2;
+  uint32 cards_with_supported_state = 3;
+  uint32 disabled_config_cards = 4;
+  uint32 deck_configs = 5;
+  uint32 searched_cards = 6;
 }

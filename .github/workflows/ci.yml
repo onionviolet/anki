@@ -107,6 +107,8 @@ jobs:
     name: check (linux)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v4
+        with:
+          submodules: true
 
       - name: Restore cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
@@ -115,9 +117,6 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            ~/.cargo/bin
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
@@ -133,9 +132,6 @@ jobs:
 
       - name: Setup build environment
         uses: ./.github/actions/setup-anki
-
-      - name: Install just
-        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 #v4
 
       - name: Install cargo-llvm-cov, cargo-nextest and cargo-deny
         uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
@@ -270,6 +266,8 @@ jobs:
     name: check (linux-arm)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v4
+        with:
+          submodules: true
 
       - name: Restore cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
@@ -296,9 +294,6 @@ jobs:
 
       - name: Setup build environment
         uses: ./.github/actions/setup-anki
-
-      - name: Install just
-        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 #v4
 
       - name: Install cargo-llvm-cov and cargo-nextest
         uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
@@ -372,9 +367,6 @@ jobs:
       - name: Setup build environment
         uses: ./.github/actions/setup-anki
 
-      - name: Install just
-        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 #v4
-
       - name: Install cargo-llvm-cov and cargo-nextest
         uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
         with:
@@ -446,9 +438,6 @@ jobs:
       - name: Setup build environment
         uses: ./.github/actions/setup-anki
 
-      - name: Install just
-        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 #v4
-
       - name: Install cargo-llvm-cov and cargo-nextest
         uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
         with:
@@ -511,9 +500,6 @@ jobs:
             D:\cargo-home\registry\index
             D:\cargo-home\registry\cache
             D:\cargo-home\git\db
-            D:\cargo-home\bin
-            D:\cargo-home\.crates.toml
-            D:\cargo-home\.crates2.json
           key: cargo-Windows-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-Windows-
 
@@ -529,9 +515,6 @@ jobs:
 
       - name: Setup build environment
         uses: ./.github/actions/setup-anki
-
-      - name: Install just
-        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 #v4
 
       - name: Install cargo-llvm-cov and cargo-nextest
         uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7
@@ -604,9 +587,6 @@ jobs:
 
       - name: Setup build environment
         uses: ./.github/actions/setup-anki
-
-      - name: Install just
-        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 #v4
 
       - name: Install cargo-llvm-cov and cargo-nextest
         uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 #v2.85.7

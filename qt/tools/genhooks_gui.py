@@ -28,6 +28,7 @@ from anki.cards import Card
 from anki.decks import DeckDict, DeckConfigDict
 from anki.hooks import runFilter, runHook
 from anki.models import NotetypeDict
+from anki.scheduler.v3 import SchedulingStates
 from anki.collection import OpChangesAfterUndo
 from aqt.qt import QDialog, QEvent, QMenu, QModelIndex, QWidget, QMimeData
 from aqt.tagedit import TagEdit
@@ -145,6 +146,18 @@ hooks = [
         legacy_no_args=True,
     ),
     Hook(
+        name="card_info_will_add_rows",
+        args=[
+            "rows: list[aqt.browser.card_info.CardInfoRow]",
+            "card: Card",
+        ],
+        doc="""Used to append add-on rows to the Card Info table.
+
+        Add-ons should append CardInfoRow instances to rows. The label and value
+        should be preformatted for display.
+        """,
+    ),
+    Hook(
         name="reviewer_will_init_answer_buttons",
         args=[
             "buttons_tuple: tuple[tuple[int, str], ...]",
@@ -182,6 +195,37 @@ hooks = [
 
         If your code just needs to be notified of the card rating event, you should use
         the reviewer_did_answer_card hook instead.""",
+    ),
+    Hook(
+        name="reviewer_will_compute_desired_retention",
+        args=[
+            "desired_retention: float | None",
+            "reviewer: aqt.reviewer.Reviewer",
+            "card: Card",
+        ],
+        return_type="float | None",
+        doc="""Used to override the desired retention used to compute the
+        current card's answer states.
+
+        Return None to use the deck/preset desired retention, or a float to ask
+        the backend scheduler to compute answer states with that desired
+        retention.
+        """,
+    ),
+    Hook(
+        name="reviewer_will_update_scheduling_states",
+        args=[
+            "states: SchedulingStates",
+            "reviewer: aqt.reviewer.Reviewer",
+            "card: Card",
+        ],
+        return_type="SchedulingStates",
+        doc="""Used to update the current card's answer states before answer
+        buttons are rendered.
+
+        The returned states are used both to render answer-button intervals and
+        to build the answer that is persisted when a button is pressed.
+        """,
     ),
     Hook(
         name="reviewer_did_answer_card",
@@ -787,9 +831,9 @@ hooks = [
         doc='''Called after standard styling is injected into an external
         html file, such as when loading the new graphs. You can use this hook to
         mutate the DOM before the page is revealed.
-        
+
         For example:
-        
+
             def mytest(webview: AnkiWebView):
                 if webview.kind != AnkiWebViewKind.DECK_STATS:
                     return
@@ -800,7 +844,7 @@ hooks = [
                     document.body.appendChild(div);
                     """
                 )
-            
+
             gui_hooks.webview_did_inject_style_into_page.append(mytest)
         ''',
     ),

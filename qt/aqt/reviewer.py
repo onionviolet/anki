@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
+import time
 from collections.abc import Callable, Generator, Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -15,8 +18,10 @@ from typing import Any, Literal, Match, Union, cast
 import aqt
 import aqt.browser
 import aqt.operations
+import aqt.rwkv_scheduler
 from anki.cards import Card, CardId
 from anki.collection import Config, OpChanges, OpChangesWithCount
+from anki.errors import NotFoundError
 from anki.lang import with_collapsed_whitespace
 from anki.scheduler.base import ScheduleCardsAsNew
 from anki.scheduler.v3 import (
@@ -58,6 +63,9 @@ from aqt.utils import (
     tooltip,
     tr,
 )
+
+logger = logging.getLogger(__name__)
+UNDO_RESTORED_CARD_ANSWER_UNBLOCK_DELAY_MS = 100
 
 
 class RefreshNeeded(Enum):
@@ -102,6 +110,15 @@ class V3CardInfo:
             queued_cards=queued_cards, states=states, context=top_card.context
         )
 
+    @staticmethod
+    def from_queue_without_states(queued_cards: QueuedCards) -> V3CardInfo:
+        top_card = queued_cards.cards[0]
+        return V3CardInfo(
+            queued_cards=queued_cards,
+            states=SchedulingStates(),
+            context=top_card.context,
+        )
+
     def top_card(self) -> QueuedCards.QueuedCard:
         return self.queued_cards.cards[0]
 
@@ -133,6 +150,43 @@ class V3CardInfo:
             return CardAnswer.EASY
 
 
+_RwkvQueueRefreshCounts = tuple[int, int, int] | None
+_RwkvQueueRefreshFinisher = Callable[
+    [bool | None, _RwkvQueueRefreshCounts],
+    None,
+]
+
+
+@dataclass
+class _RwkvQueueRefreshRequest:
+    queued_at: float | None
+    answered_card_id: CardId | None
+    reason: str
+    wait_for_backend: bool
+    refresh_remaining_counts: bool
+    count_card_id: CardId | None
+    count_generation: int | None
+    finishers: list[_RwkvQueueRefreshFinisher]
+
+    def coalesce(self, newer: _RwkvQueueRefreshRequest) -> None:
+        self.queued_at = newer.queued_at
+        self.answered_card_id = newer.answered_card_id
+        self.reason = newer.reason
+        self.wait_for_backend = self.wait_for_backend or newer.wait_for_backend
+        self.refresh_remaining_counts = (
+            self.refresh_remaining_counts or newer.refresh_remaining_counts
+        )
+        self.count_card_id = newer.count_card_id
+        self.count_generation = newer.count_generation
+        self.finishers.extend(newer.finishers)
+
+
+@dataclass(frozen=True)
+class _RwkvDeferredQueueRefresh:
+    queued_at: float
+    answered_card_id: CardId
+
+
 class AnswerAction(Enum):
     BURY_CARD = 0
     ANSWER_AGAIN = 1
@@ -159,7 +213,29 @@ class Reviewer:
         self.state: Literal["question", "answer", "transition"] | None = None
         self._refresh_needed: RefreshNeeded | None = None
         self._v3: V3CardInfo | None = None
+        self._desired_retention_override: float | None = None
+        self._qa_update_id = 0
+        self._question_update_id: int | None = None
+        self._question_rendered = False
+        self._answer_update_id: int | None = None
+        self._answer_rendered = False
+        self._review_actions_blocked = False
+        self._review_actions_block_id = 0
+        self._qa_transition_active = False
+        self._review_answer_actions_blocked = False
+        self._review_answer_actions_block_id = 0
+        self._review_card_generation = 0
+        self._rwkv_remaining_count_override: (
+            tuple[int, tuple[int, int, int] | None] | None
+        ) = None
+        self._rwkv_deferred_queue_refresh: _RwkvDeferredQueueRefresh | None = None
+        self._rwkv_empty_queue_refresh: _RwkvDeferredQueueRefresh | None = None
+        self._rwkv_empty_queue_recovery_generation: int | None = None
+        self._rwkv_empty_queue_recovery_attempted = False
+        self._rwkv_after_question_shown_callbacks: list[Callable[[], None]] = []
+        self._rwkv_undo_restored_card_active = False
         self._state_mutation_key = str(random.randint(0, 2**64 - 1))
+        self._scheduling_states_pending = False
         self.bottom = BottomBar(mw, mw.bottomWeb)
         self._card_info = ReviewerCardInfo(self.mw)
         self._previous_card_info = PreviousReviewerCardInfo(self.mw)
@@ -176,10 +252,13 @@ class Reviewer:
             self.mw.moveToState("deckBrowser")
             show_warning(tr.scheduling_update_required().replace("V2", "v3"))
             return
+        self.set_review_actions_blocked(False)
+        self._set_review_answer_actions_blocked(False)
         self.mw.setStateShortcuts(self._shortcutKeys())  # type: ignore
         self.web.set_bridge_command(self._linkHandler, self)
         self.bottom.web.set_bridge_command(self._linkHandler, ReviewerBottomBar(self))
         self._state_mutation_js = self.mw.col.get_config("cardStateCustomizer")
+        aqt.rwkv_scheduler.configure_reviewer_backend_from_environment()
         self._reps = None
         self._refresh_needed = RefreshNeeded.QUEUES
         self.refresh_if_needed()
@@ -197,14 +276,72 @@ class Reviewer:
 
     def cleanup(self) -> None:
         gui_hooks.reviewer_will_end()
+        if (
+            self._answeredIds
+            and aqt.rwkv_scheduler.reviewer_queue_order_exit_refresh_needed(self)
+        ):
+            self._prepare_rwkv_queue_order_on_exit()
+        self._cancel_qa_transition()
         self.card = None
         self.auto_advance_enabled = False
+        self._question_update_id = None
+        self._question_rendered = False
+        self._answer_update_id = None
+        self._answer_rendered = False
+        self._rwkv_deferred_queue_refresh = None
+        self._rwkv_empty_queue_refresh = None
+        self._rwkv_empty_queue_recovery_generation = None
+        self._rwkv_empty_queue_recovery_attempted = False
+        self._rwkv_after_question_shown_callbacks = []
+        self.set_review_actions_blocked(False)
+        self._set_review_answer_actions_blocked(False)
+        aqt.rwkv_scheduler.request_rwkv_state_cache_recovery(
+            self.mw,
+            reason="reviewer exit",
+        )
 
     def refresh_if_needed(self) -> None:
         if self._refresh_needed is RefreshNeeded.QUEUES:
-            self.nextCard()
-            self.mw.fade_in_webview()
-            self._refresh_needed = None
+            if getattr(
+                self, "_undo_refresh_pending", False
+            ) or aqt.rwkv_scheduler.reviewer_has_undo_card_ids(self):
+                self._undo_refresh_pending = False
+                self.nextCard()
+                self.mw.fade_in_webview()
+                self._refresh_needed = None
+            else:
+                undo_restored_card = self._current_card_is_rwkv_undo_restored()
+                current_card_was_deleted = bool(
+                    self.card is not None
+                    and undo_restored_card
+                    and self._current_card_was_deleted()
+                )
+
+                if undo_restored_card and not current_card_was_deleted:
+                    logger.debug(
+                        "ignored study queue refresh while RWKV undo-restored card is active: card_id=%s",
+                        self.card.id if self.card else None,
+                    )
+                    self._refresh_needed = None
+                elif aqt.rwkv_scheduler.reviewer_queue_order_enabled(self):
+                    if self.card is not None and not current_card_was_deleted:
+                        current_card_was_deleted = self._current_card_was_deleted()
+                    if current_card_was_deleted:
+                        self._begin_deleted_card_transition()
+                    self._refresh_needed = None
+                    if aqt.rwkv_scheduler.consume_reviewer_pruned_queue_scores(self):
+                        self.nextCard()
+                        self.mw.fade_in_webview()
+                    else:
+                        self._prepare_rwkv_queue_order_then_next_card(
+                            fade_after=True,
+                            show_next_card=True,
+                        )
+                else:
+                    aqt.rwkv_scheduler.prepare_reviewer_queue_order(self)
+                    self.nextCard()
+                    self.mw.fade_in_webview()
+                    self._refresh_needed = None
         elif self._refresh_needed is RefreshNeeded.NOTE_TEXT:
             self._redraw_current_card()
             self.mw.fade_in_webview()
@@ -229,10 +366,52 @@ class Reviewer:
             elif changes.card:
                 self._refresh_needed = RefreshNeeded.FLAG
 
-        if focused and self._refresh_needed:
+        should_refresh = focused or (
+            self._refresh_needed is RefreshNeeded.QUEUES
+            and (
+                getattr(self, "_undo_refresh_pending", False)
+                or aqt.rwkv_scheduler.reviewer_has_undo_card_ids(self)
+                or self._current_card_is_rwkv_undo_restored()
+            )
+        )
+        if should_refresh and self._refresh_needed:
             self.refresh_if_needed()
 
         return bool(self._refresh_needed)
+
+    def _current_card_is_rwkv_undo_restored(self) -> bool:
+        return bool(
+            self.card is not None
+            and getattr(
+                self,
+                "_rwkv_undo_restored_card_active",
+                False,
+            )
+        )
+
+    def _current_card_was_deleted(self) -> bool:
+        assert self.card is not None
+        try:
+            self.card.load()
+        except NotFoundError:
+            aqt.rwkv_scheduler.defer_reviewer_backend_cache_restore(
+                self,
+                reason="reviewer card deleted",
+            )
+            logger.debug(
+                "advancing past deleted reviewer card: card_id=%s",
+                self.card.id,
+            )
+            return True
+        return False
+
+    def _begin_deleted_card_transition(self) -> None:
+        assert self.card is not None
+        self.state = "transition"
+        self._clear_auto_advance_timers()
+        self._begin_qa_transition()
+        update_context = self._next_qa_update_context("transition")
+        self.web.eval(f"_clearQAForTransition({json.dumps(update_context)});")
 
     def _redraw_current_card(self) -> None:
         self.card.load()
@@ -241,35 +420,277 @@ class Reviewer:
         else:
             self._showQuestion()
 
+    def _next_qa_update_context(self, kind: str) -> str:
+        assert self.card is not None
+        self._qa_update_id += 1
+        return f"{kind}:{self._qa_update_id}:{self.card.id}"
+
+    def _begin_qa_transition(self) -> None:
+        if getattr(self, "_qa_transition_active", False):
+            return
+        self._qa_transition_active = True
+        self._set_qa_interaction_enabled(False)
+        self._set_bottom_transition_active(True)
+
+    def _set_qa_interaction_enabled(self, enabled: bool) -> None:
+        web = getattr(self, "web", None)
+        if callable(eval_js := getattr(web, "eval", None)):
+            eval_js(f"_setQAInteractionEnabled({json.dumps(enabled)});")
+
+    def _set_bottom_transition_active(self, active: bool) -> None:
+        bottom = getattr(self, "bottom", None)
+        bottom_web = getattr(bottom, "web", None)
+        if callable(eval_js := getattr(bottom_web, "eval", None)):
+            eval_js(f"setReviewerTransitionActive({json.dumps(active)});")
+
+    def _finish_qa_transition(self) -> None:
+        self.web.update()
+        if callable(repaint := getattr(self.web, "repaint", None)):
+            repaint()
+        self._set_bottom_transition_active(False)
+        self._qa_transition_active = False
+
+    def _cancel_qa_transition(self) -> None:
+        self._set_qa_interaction_enabled(True)
+        self._set_bottom_transition_active(False)
+        self._qa_transition_active = False
+
+    def set_review_actions_blocked(self, blocked: bool) -> None:
+        self._review_actions_block_id = getattr(self, "_review_actions_block_id", 0) + 1
+        self._review_actions_blocked = blocked
+
+    def begin_undo(self) -> None:
+        self._undo_operation_pending = True
+        self._clear_auto_advance_timers()
+        self.set_review_actions_blocked(True)
+        self._set_qa_interaction_enabled(False)
+        self._set_bottom_transition_active(True)
+
+    def finish_undo(self, changes: OpChanges | None) -> None:
+        self._undo_operation_pending = False
+        self._undo_refresh_pending = bool(
+            changes and changes.study_queues and self.mw.state == "review"
+        )
+        self.set_review_actions_blocked(self._undo_refresh_pending)
+        if self._undo_refresh_pending:
+            self._begin_qa_transition()
+        elif not getattr(self, "_qa_transition_active", False):
+            self._set_qa_interaction_enabled(True)
+            self._set_bottom_transition_active(False)
+
+    def _review_actions_are_blocked(self) -> bool:
+        return (
+            getattr(self, "_undo_operation_pending", False)
+            or getattr(self, "_undo_refresh_pending", False)
+            or getattr(self, "_review_actions_blocked", False)
+            or getattr(self, "_qa_transition_active", False)
+        )
+
+    def _set_review_answer_actions_blocked(self, blocked: bool) -> None:
+        self._review_answer_actions_block_id = (
+            getattr(self, "_review_answer_actions_block_id", 0) + 1
+        )
+        self._review_answer_actions_blocked = blocked
+
+    def _answer_actions_are_blocked(self) -> bool:
+        return self._review_actions_are_blocked() or getattr(
+            self, "_review_answer_actions_blocked", False
+        )
+
+    def _block_answer_actions_after_undo_redraw(self) -> None:
+        self._set_review_answer_actions_blocked(True)
+        block_id = getattr(self, "_review_answer_actions_block_id", 0)
+
+        def unblock_if_current() -> None:
+            if getattr(self, "_review_answer_actions_block_id", 0) == block_id:
+                self._set_review_answer_actions_blocked(False)
+
+        self.mw.progress.single_shot(
+            UNDO_RESTORED_CARD_ANSWER_UNBLOCK_DELAY_MS, unblock_if_current
+        )
+
     # Fetching a card
     ##########################################################################
 
     def nextCard(self) -> None:
+        if getattr(self, "_rwkv_empty_queue_recovery_generation", None) == getattr(
+            self, "_review_card_generation", 0
+        ):
+            return
+        start = time.monotonic()
+        self._review_card_generation = getattr(self, "_review_card_generation", 0) + 1
+        count_override = getattr(self, "_rwkv_remaining_count_override", None)
+        if (
+            count_override is not None
+            and count_override[0] != self._review_card_generation
+        ):
+            self._rwkv_remaining_count_override = None
         self.previous_card = self.card
         self.card = None
         self._v3 = None
-        self._get_next_v3_card()
+        self._scheduling_states_pending = False
+        self._desired_retention_override = None
+        self._question_update_id = None
+        self._question_rendered = False
+        self._answer_update_id = None
+        self._answer_rendered = False
+        self._rwkv_undo_restored_card_active = False
+        restored_undo_card = self._get_rwkv_undo_restored_card()
+        if not restored_undo_card:
+            self._get_next_v3_card()
 
         self._previous_card_info.set_card(self.previous_card)
         self._card_info.set_card(self.card)
 
         if not self.card:
+            if self._retry_deferred_rwkv_queue_refresh():
+                return
+            if self._retry_rwkv_state_recovery():
+                return
+            self._cancel_qa_transition()
+            self.set_review_actions_blocked(False)
+            self._set_review_answer_actions_blocked(False)
             self.mw.moveToState("overview")
             return
 
+        self._rwkv_empty_queue_recovery_attempted = False
         if self._reps is None:
             self._initWeb()
 
         self._showQuestion()
+        self.set_review_actions_blocked(False)
+        if restored_undo_card:
+            self._block_answer_actions_after_undo_redraw()
+        else:
+            self._set_review_answer_actions_blocked(False)
+        logger.debug(
+            "reviewer nextCard displayed question: previous_card_id=%s card_id=%s elapsed_ms=%.1f",
+            self.previous_card.id if self.previous_card else None,
+            self.card.id if self.card else None,
+            (time.monotonic() - start) * 1000,
+        )
 
     def _get_next_v3_card(self) -> None:
+        start = time.monotonic()
         assert isinstance(self.mw.col.sched, V3Scheduler)
-        output = self.mw.col.sched.get_queued_cards()
+        queue_hook_count = gui_hooks.reviewer_will_compute_desired_retention.count()
+        queue_start = time.monotonic()
+        if queue_hook_count > 0:
+            output = self.mw.col.sched.get_queued_cards_without_states()
+        else:
+            output = self.mw.col.sched.get_queued_cards()
+        queue_elapsed_ms = (time.monotonic() - queue_start) * 1000
         if not output.cards:
+            logger.debug(
+                "reviewer fetched no queued cards: desired_retention_hooks=%s elapsed_ms=%.1f",
+                queue_hook_count,
+                (time.monotonic() - start) * 1000,
+            )
             return
-        self._v3 = V3CardInfo.from_queue(output)
+        init_hook_count = gui_hooks.reviewer_will_compute_desired_retention.count()
+        self._v3 = (
+            V3CardInfo.from_queue_without_states(output)
+            if init_hook_count > 0
+            else V3CardInfo.from_queue(output)
+        )
+        self._scheduling_states_pending = init_hook_count > 0
         self.card = Card(self.mw.col, backend_card=self._v3.top_card().card)
+        fill_hook_count = gui_hooks.reviewer_will_compute_desired_retention.count()
+        desired_retention_elapsed_ms = 0.0
+        scheduling_states_elapsed_ms = 0.0
+        if fill_hook_count > 0:
+            desired_retention_start = time.monotonic()
+            self._desired_retention_override = (
+                gui_hooks.reviewer_will_compute_desired_retention(None, self, self.card)
+            )
+            desired_retention_elapsed_ms = (
+                time.monotonic() - desired_retention_start
+            ) * 1000
+            scheduling_states_start = time.monotonic()
+            self._v3.states = self.mw.col.sched.get_scheduling_states(
+                self.card.id,
+                desired_retention_override=self._desired_retention_override,
+            )
+            scheduling_states_elapsed_ms = (
+                time.monotonic() - scheduling_states_start
+            ) * 1000
+            self._v3.states.current.custom_data = self.card.custom_data
+            self._scheduling_states_pending = False
+        else:
+            self._scheduling_states_pending = False
+        logger.debug(
+            "reviewer fetched queued card: card_id=%s desired_retention_hooks=(queue:%s init:%s fill:%s) "
+            "queue_elapsed_ms=%.1f desired_retention_elapsed_ms=%.1f scheduling_states_elapsed_ms=%.1f "
+            "elapsed_ms=%.1f",
+            self.card.id,
+            queue_hook_count,
+            init_hook_count,
+            fill_hook_count,
+            queue_elapsed_ms,
+            desired_retention_elapsed_ms,
+            scheduling_states_elapsed_ms,
+            (time.monotonic() - start) * 1000,
+        )
+        if self._v3.states.current.WhichOneof("kind") is None:
+            logger.warning(
+                "reviewer fetched queued card with empty scheduling states: "
+                "card_id=%s card_type=%s queue=%s due=%s interval=%s reps=%s lapses=%s "
+                "desired_retention_hooks=(queue:%s init:%s fill:%s) update_state_hooks=%s "
+                "desired_retention_override=%s states=%r",
+                self.card.id,
+                self.card.type,
+                self.card.queue,
+                self.card.due,
+                self.card.ivl,
+                self.card.reps,
+                self.card.lapses,
+                queue_hook_count,
+                init_hook_count,
+                fill_hook_count,
+                gui_hooks.reviewer_will_update_scheduling_states.count(),
+                self._desired_retention_override,
+                self._v3.states,
+            )
         self.card.start_timer()
+
+    def _get_rwkv_undo_restored_card(self) -> bool:
+        while card_id := aqt.rwkv_scheduler.pop_reviewer_undo_card_id(self):
+            try:
+                sched = cast(V3Scheduler, self.mw.col.sched)
+                sched.rebuild_queued_cards_preserving_current_card(CardId(card_id))
+                self._get_next_v3_card()
+            except Exception:
+                logger.exception(
+                    "failed to rebuild queue for RWKV undo-restored card: card_id=%s",
+                    card_id,
+                )
+                self.card = None
+                self._v3 = None
+                continue
+
+            if self.card is None or self.card.id != card_id:
+                logger.warning(
+                    "rebuilt queue did not restore expected RWKV undone card: "
+                    "expected_card_id=%s actual_card_id=%s",
+                    card_id,
+                    self.card.id if self.card else None,
+                )
+                self.card = None
+                self._v3 = None
+                continue
+
+            self._rwkv_undo_restored_card_active = True
+            logger.debug(
+                "reviewer restored RWKV undone card on rebuilt queue: "
+                "card_id=%s counts=(new:%s learning:%s review:%s)",
+                card_id,
+                self._v3.queued_cards.new_count,
+                self._v3.queued_cards.learning_count,
+                self._v3.queued_cards.review_count,
+            )
+            return True
+
+        return False
 
     def get_scheduling_states(self) -> SchedulingStates:
         return self._v3.states
@@ -279,9 +700,69 @@ class Reviewer:
 
     def set_scheduling_states(self, request: SetSchedulingStatesRequest) -> None:
         if request.key != self._state_mutation_key:
+            logger.warning(
+                "ignored custom scheduling state mutation with stale key for card %s",
+                self.card.id if self.card else None,
+            )
             return
 
+        if request.states.current.WhichOneof("kind") is None:
+            logger.warning(
+                "custom scheduling state mutation provided empty states for card %s: %r",
+                self.card.id if self.card else None,
+                request.states,
+            )
+        if request.states.current != self._v3.states.current:
+            logger.warning(
+                "custom scheduling state mutation changed current state for card %s: %r -> %r",
+                self.card.id if self.card else None,
+                self._v3.states.current,
+                request.states.current,
+            )
         self._v3.states = request.states
+
+    def _scheduling_states_are_populated(self) -> bool:
+        return (
+            self._v3 is not None
+            and self._v3.states.current.WhichOneof("kind") is not None
+        )
+
+    def _populate_scheduling_states(self, reason: str) -> bool:
+        if self.card is None or self._v3 is None:
+            return False
+
+        start = time.monotonic()
+        try:
+            sched = cast(V3Scheduler, self.mw.col.sched)
+            states = sched.get_scheduling_states(
+                self.card.id,
+                desired_retention_override=self._desired_retention_override,
+            )
+        except Exception:
+            logger.exception(
+                "failed to populate scheduling states for card %s before %s",
+                self.card.id,
+                reason,
+            )
+            return False
+
+        states.current.custom_data = self.card.custom_data
+        self._v3.states = states
+        self._scheduling_states_pending = False
+        logger.warning(
+            "populated empty reviewer scheduling states for card %s before %s elapsed_ms=%.1f",
+            self.card.id,
+            reason,
+            (time.monotonic() - start) * 1000,
+        )
+        return True
+
+    def _ensure_scheduling_states_ready(self, reason: str) -> bool:
+        if self._scheduling_states_are_populated():
+            return True
+        if self._scheduling_states_pending:
+            return False
+        return self._populate_scheduling_states(reason)
 
     def _run_state_mutation_hook(self) -> None:
         def on_eval(result: Any) -> None:
@@ -368,9 +849,14 @@ class Reviewer:
         return self.typeAnsFilter(self.mw.prepare_card_text_for_display(buf))
 
     def _showQuestion(self) -> None:
+        start = time.monotonic()
+        self._begin_qa_transition()
         self._reps += 1
         self.state = "question"
         self.typedAnswer: str | None = None
+        self._question_rendered = False
+        self._answer_update_id = None
+        self._answer_rendered = False
         c = self.card
         # grab the question and play audio
         q = c.question()
@@ -392,17 +878,53 @@ class Reviewer:
 
         bodyclass = theme_manager.body_classes_for_card_ord(c.ord)
         a = self.mw.col.media.escape_media_filenames(c.answer())
+        update_context = self._next_qa_update_context("question")
+        self._question_update_id = self._qa_update_id
 
         self.web.eval(
-            f"_showQuestion({json.dumps(q)}, {json.dumps(a)}, '{bodyclass}');"
+            f"_showQuestion({json.dumps(q)}, {json.dumps(a)}, "
+            f"{json.dumps(bodyclass)}, {json.dumps(update_context)});"
+        )
+        logger.debug(
+            "reviewer handed question to webview: card_id=%s update_context=%s elapsed_ms=%.1f",
+            c.id,
+            update_context,
+            (time.monotonic() - start) * 1000,
         )
         self._update_flag_icon()
         self._update_mark_icon()
+
+    def _current_question_is_rendered(self, update_id: int | None = None) -> bool:
+        if self.state != "question" or self.card is None:
+            return False
+        if not getattr(self, "_question_rendered", False):
+            return False
+        if update_id is not None and update_id != getattr(
+            self, "_question_update_id", None
+        ):
+            return False
+        return True
+
+    def _on_question_rendered(self, update_id: int, card_id: CardId) -> None:
+        if self.state != "question" or self.card is None or self.card.id != card_id:
+            return
+        if self._question_update_id != update_id:
+            self._question_rendered = False
+            logger.debug(
+                "ignored stale question render: current_update_id=%s rendered_update_id=%s card_id=%s",
+                self._question_update_id,
+                update_id,
+                self.card.id,
+            )
+            return
+
+        self._question_rendered = True
+        self._finish_qa_transition()
         self._showAnswerButton()
         self.mw.web.setFocus()
-        # user hook
-        gui_hooks.reviewer_did_show_question(c)
+        gui_hooks.reviewer_did_show_question(self.card)
         self._auto_advance_to_answer_if_enabled()
+        self._run_after_question_shown_callbacks()
 
     def _auto_advance_to_answer_if_enabled(self) -> None:
         self._clear_auto_advance_timers()
@@ -461,6 +983,18 @@ class Reviewer:
         if self.mw.state != "review":
             # showing resetRequired screen; ignore space
             return
+        if self._review_actions_are_blocked():
+            return
+        if self.card is None or self._v3 is None:
+            return
+        if self.state == "question" and not self._current_question_is_rendered():
+            logger.debug(
+                "ignored show answer before current question rendered: card_id=%s update_id=%s",
+                self.card.id,
+                self._question_update_id,
+            )
+            return
+        self._begin_qa_transition()
         self.state = "answer"
         c = self.card
         a = c.answer()
@@ -475,12 +1009,26 @@ class Reviewer:
         av_player.play_tags(sounds)
         a = self._mungeQA(a)
         a = gui_hooks.card_will_show(a, c, "reviewAnswer")
-        # render and update bottom
-        self.web.eval(f"_showAnswer({json.dumps(a)});")
+        self._answer_rendered = False
+        update_context = self._next_qa_update_context("answer")
+        self._answer_update_id = self._qa_update_id
+        self.web.eval(
+            f"_showAnswer({json.dumps(a)}, null, {json.dumps(update_context)});"
+        )
+
+    def _on_answer_rendered(self, update_id: int, card_id: CardId) -> None:
+        if (
+            self.state != "answer"
+            or self.card is None
+            or self.card.id != card_id
+            or self._answer_update_id != update_id
+        ):
+            return
+        self._answer_rendered = True
+        self._finish_qa_transition()
         self._showEaseButtons()
         self.mw.web.setFocus()
-        # user hook
-        gui_hooks.reviewer_did_show_answer(c)
+        gui_hooks.reviewer_did_show_answer(self.card)
         self._auto_advance_to_question_if_enabled()
 
     def _auto_advance_to_question_if_enabled(self) -> None:
@@ -530,10 +1078,13 @@ class Reviewer:
 
     def _answerCard(self, ease: Literal[1, 2, 3, 4]) -> None:
         "Reschedule card and show next."
+        start = time.monotonic()
         if self.mw.state != "review":
             # showing resetRequired screen; ignore key
             return
-        if self.state != "answer":
+        if self._answer_actions_are_blocked():
+            return
+        if self.state != "answer" or not self._answer_rendered:
             return
         proceed, ease = gui_hooks.reviewer_will_answer_card(
             (True, ease), self, self.card
@@ -541,32 +1092,672 @@ class Reviewer:
         if not proceed:
             return
 
+        answered_card = self.card
         sched = cast(V3Scheduler, self.mw.col.sched)
+        if not self._ensure_scheduling_states_ready("answering"):
+            logger.warning(
+                "ignored answer while scheduling states are not ready for card %s",
+                self.card.id if self.card else None,
+            )
+            return
+        build_start = time.monotonic()
         answer = sched.build_answer(
             card=self.card,
             states=self._v3.states,
             rating=self._v3.rating_from_ease(ease),
+            desired_retention_override=self._desired_retention_override,
+        )
+        aqt.rwkv_scheduler.set_answer_rwkv_metadata(answer, self, self.card, ease)
+        logger.debug(
+            "reviewer built answer: card_id=%s ease=%s build_elapsed_ms=%.1f elapsed_ms=%.1f",
+            self.card.id,
+            ease,
+            (time.monotonic() - build_start) * 1000,
+            (time.monotonic() - start) * 1000,
         )
 
         def after_answer(changes: OpChanges) -> None:
+            after_answer_start = time.monotonic()
+            answered_card_id = self.card.id if self.card else None
+            update_undo_actions = getattr(self.mw, "update_undo_actions", None)
+            if callable(update_undo_actions):
+                update_undo_actions()
             if gui_hooks.reviewer_did_answer_card.count() > 0:
                 self.card.load()
             # v3 scheduler doesn't report this
             suspended = self.card is not None and self.card.queue < 0
+            self._rwkv_undo_restored_card_active = False
             self._after_answering(ease)
+            logger.debug(
+                "reviewer answer operation finished: card_id=%s ease=%s operation_elapsed_ms=%.1f "
+                "after_answer_elapsed_ms=%.1f",
+                answered_card_id,
+                ease,
+                (time.monotonic() - start) * 1000,
+                (time.monotonic() - after_answer_start) * 1000,
+            )
             if sched.state_is_leech(answer.new_state):
                 self.onLeech(suspended)
 
         self.state = "transition"
-        answer_card(parent=self.mw, answer=answer).success(
-            after_answer
-        ).run_in_background(initiator=self)
+        self._begin_qa_transition()
+        answer_card(
+            parent=self.mw,
+            answer=answer,
+            after_answer=lambda: aqt.rwkv_scheduler.record_reviewer_answer(
+                self,
+                answered_card,
+                ease,
+            ),
+        ).success(after_answer).run_in_background(initiator=self)
 
     def _after_answering(self, ease: Literal[1, 2, 3, 4]) -> None:
         gui_hooks.reviewer_did_answer_card(self, self.card, ease)
         self._answeredIds.append(self.card.id)
-        if not self.check_timebox():
+        if self.check_timebox():
+            return
+
+        rwkv_queue_order_enabled = aqt.rwkv_scheduler.reviewer_queue_order_enabled(self)
+        rwkv_queue_order_refresh_required = (
+            rwkv_queue_order_enabled
+            and aqt.rwkv_scheduler.reviewer_queue_order_refresh_required(self)
+        )
+        rwkv_queue_order_refresh_due = (
+            rwkv_queue_order_enabled
+            and aqt.rwkv_scheduler.reviewer_queue_order_refresh_due(self)
+        )
+        rwkv_last_queued_card = (
+            rwkv_queue_order_enabled and self._answered_card_was_last_queued_card()
+        )
+        rwkv_last_queued_review = (
+            rwkv_queue_order_enabled
+            and not rwkv_last_queued_card
+            and self._answered_card_was_last_queued_review()
+        )
+        if (
+            rwkv_queue_order_refresh_required
+            or rwkv_queue_order_refresh_due
+            or rwkv_last_queued_card
+            or rwkv_last_queued_review
+        ):
+            queued_at = time.monotonic()
+            answered_card_id = self.card.id
+            refresh_before_next_card = rwkv_queue_order_refresh_required or (
+                rwkv_queue_order_refresh_due
+                and aqt.rwkv_scheduler.reviewer_queue_order_refresh_before_next_card(
+                    self
+                )
+            )
+            if (
+                rwkv_last_queued_card
+                or rwkv_last_queued_review
+                or refresh_before_next_card
+            ):
+                self._prepare_rwkv_queue_order_then_next_card(
+                    queued_at,
+                    answered_card_id=answered_card_id,
+                    show_next_card=True,
+                )
+            else:
+                if aqt.rwkv_scheduler.reviewer_queue_order_needs_intervening_review_refresh(
+                    self
+                ):
+                    aqt.rwkv_scheduler.update_reviewer_queue_intervening_reviews(
+                        self, self.card
+                    )
+                self._rwkv_remaining_count_override = (
+                    getattr(self, "_review_card_generation", 0) + 1,
+                    None,
+                )
+                self._defer_rwkv_queue_order_refresh(
+                    queued_at=queued_at,
+                    answered_card_id=answered_card_id,
+                )
+                self.nextCard()
+        elif rwkv_queue_order_enabled:
+            if aqt.rwkv_scheduler.reviewer_queue_order_needs_intervening_review_refresh(
+                self
+            ):
+                aqt.rwkv_scheduler.update_reviewer_queue_intervening_reviews(
+                    self, self.card
+                )
+            aqt.rwkv_scheduler.refresh_answered_card_queue_score(self, self.card)
             self.nextCard()
+        else:
+            aqt.rwkv_scheduler.prepare_reviewer_queue_order(self)
+            self.nextCard()
+
+    def _answered_card_was_last_queued_card(self) -> bool:
+        v3 = getattr(self, "_v3", None)
+        if v3 is None:
+            return False
+
+        queued_cards = v3.queued_cards
+        queued_count = (
+            queued_cards.new_count
+            + queued_cards.learning_count
+            + queued_cards.review_count
+        )
+        return queued_count <= 1
+
+    def _answered_card_was_last_queued_review(self) -> bool:
+        v3 = getattr(self, "_v3", None)
+        if v3 is None or v3.queued_cards.review_count != 1:
+            return False
+
+        return v3.top_card().queue == QueuedCards.REVIEW
+
+    def _prepare_rwkv_queue_order_then_next_card(
+        self,
+        queued_at: float | None = None,
+        *,
+        answered_card_id: CardId | None = None,
+        fade_after: bool = False,
+        show_next_card: bool = False,
+        refresh_remaining_counts: bool = False,
+    ) -> None:
+        if not show_next_card:
+            self._prepare_rwkv_queue_order_async(
+                queued_at,
+                answered_card_id=answered_card_id,
+                refresh_remaining_counts=refresh_remaining_counts,
+            )
+            return
+
+        if answered_card_id is None:
+            answered_card_id = self.card.id if self.card else None
+        initial_state = self.state
+        initial_generation = getattr(self, "_review_card_generation", 0)
+
+        def show_next(_installed: bool | None) -> None:
+            if self._rwkv_queue_refresh_target_is_current(
+                answered_card_id,
+                initial_state,
+                initial_generation,
+            ):
+                self.nextCard()
+                if fade_after:
+                    self.mw.fade_in_webview()
+            elif (
+                getattr(self, "_review_card_generation", 0) == initial_generation
+                and self.state == "transition"
+                and self.card is not None
+                and self.card.id == answered_card_id
+            ):
+                self.nextCard()
+
+        self._prepare_rwkv_queue_order_async(
+            queued_at,
+            answered_card_id=answered_card_id,
+            on_finished=show_next,
+            wait_for_backend=True,
+        )
+
+    def _prepare_rwkv_queue_order_async(
+        self,
+        queued_at: float | None = None,
+        *,
+        answered_card_id: CardId | None = None,
+        reason: str = "review queue",
+        on_finished: Callable[[bool | None], None] | None = None,
+        wait_for_backend: bool = False,
+        refresh_remaining_counts: bool = False,
+    ) -> None:
+        if answered_card_id is None:
+            answered_card_id = self.card.id if self.card else None
+        count_card_id = self.card.id if self.card is not None else None
+        count_generation = (
+            getattr(self, "_review_card_generation", 0)
+            if count_card_id is not None
+            else None
+        )
+        requested_at = time.monotonic()
+
+        def finish_request(
+            installed: bool | None,
+            counts: _RwkvQueueRefreshCounts,
+        ) -> None:
+            logger.debug(
+                "reviewer RWKV queue order async request finished: reason=%s "
+                "answered_card_id=%s installed=%s elapsed_ms=%.1f",
+                reason,
+                answered_card_id,
+                installed,
+                (time.monotonic() - requested_at) * 1000,
+            )
+            if (
+                refresh_remaining_counts
+                and count_card_id is not None
+                and count_generation is not None
+            ):
+                self._finish_rwkv_remaining_count_refresh(
+                    card_id=count_card_id,
+                    generation=count_generation,
+                    counts=counts if installed else None,
+                )
+            if on_finished is not None:
+                on_finished(installed)
+
+        request = _RwkvQueueRefreshRequest(
+            queued_at=queued_at,
+            answered_card_id=answered_card_id,
+            reason=reason,
+            wait_for_backend=wait_for_backend,
+            refresh_remaining_counts=refresh_remaining_counts,
+            count_card_id=count_card_id,
+            count_generation=count_generation,
+            finishers=[finish_request],
+        )
+        if getattr(self, "_rwkv_queue_refresh_in_flight", False):
+            pending = getattr(self, "_rwkv_queue_refresh_pending", None)
+            if isinstance(pending, _RwkvQueueRefreshRequest):
+                pending.coalesce(request)
+            else:
+                self._rwkv_queue_refresh_pending = request
+            logger.debug(
+                "reviewer RWKV queue order async refresh coalesced: reason=%s "
+                "answered_card_id=%s",
+                reason,
+                answered_card_id,
+            )
+            return
+
+        self._rwkv_queue_refresh_in_flight = True
+        self._start_rwkv_queue_order_async(request)
+
+    def _start_rwkv_queue_order_async(
+        self,
+        request: _RwkvQueueRefreshRequest,
+    ) -> None:
+        answered_card_id = request.answered_card_id
+        reason = request.reason
+        remaining_count_card_id = (
+            request.count_card_id if request.refresh_remaining_counts else None
+        )
+        start = time.monotonic()
+        finished = False
+        stale_retry_available = request.wait_for_backend
+        logger.debug(
+            "reviewer RWKV queue order async refresh starting: reason=%s "
+            "answered_card_id=%s waiters=%s main_delay_ms=%.1f",
+            reason,
+            answered_card_id,
+            len(request.finishers),
+            (
+                (start - request.queued_at) * 1000
+                if request.queued_at is not None
+                else 0.0
+            ),
+        )
+
+        def finish(
+            *,
+            installed: bool | None = None,
+            counts: _RwkvQueueRefreshCounts = None,
+        ) -> None:
+            nonlocal finished
+            if finished:
+                return
+            finished = True
+            logger.debug(
+                "reviewer RWKV queue order async refresh finished: reason=%s "
+                "answered_card_id=%s installed=%s waiters=%s elapsed_ms=%.1f",
+                reason,
+                answered_card_id,
+                installed,
+                len(request.finishers),
+                (time.monotonic() - start) * 1000,
+            )
+
+            update_undo_actions = getattr(self.mw, "update_undo_actions", None)
+            if callable(update_undo_actions):
+                update_undo_actions()
+
+            for finisher in request.finishers:
+                try:
+                    finisher(installed, counts)
+                except Exception:
+                    logger.exception("RWKV queue refresh completion callback failed")
+
+            pending = getattr(self, "_rwkv_queue_refresh_pending", None)
+            if hasattr(self, "_rwkv_queue_refresh_pending"):
+                del self._rwkv_queue_refresh_pending
+            if isinstance(pending, _RwkvQueueRefreshRequest):
+                self._start_rwkv_queue_order_async(pending)
+            else:
+                self._rwkv_queue_refresh_in_flight = False
+
+        def build_work() -> aqt.rwkv_scheduler.RwkvReviewQueueOrderAsyncWork | None:
+            build_start = time.monotonic()
+            work = (
+                aqt.rwkv_scheduler.prepare_reviewer_queue_order_async_work(self)
+                if reason == "review queue"
+                else aqt.rwkv_scheduler.prepare_reviewer_queue_order_async_work(
+                    self,
+                    reason=reason,
+                )
+            )
+            logger.debug(
+                "reviewer RWKV queue order async work prepared: "
+                "reason=%s answered_card_id=%s work=%s elapsed_ms=%.1f",
+                reason,
+                answered_card_id,
+                work is not None,
+                (time.monotonic() - build_start) * 1000,
+            )
+            return work
+
+        def build_done(
+            future: Future[aqt.rwkv_scheduler.RwkvReviewQueueOrderAsyncWork | None],
+        ) -> None:
+            try:
+                work = future.result()
+            except Exception:
+                logger.exception("RWKV review queue async work preparation failed")
+                finish(installed=False)
+                return
+            if work is None:
+                finish(installed=False)
+                return
+
+            def score() -> aqt.rwkv_scheduler.RwkvReviewQueueOrderAsyncResult:
+                if request.wait_for_backend:
+                    return aqt.rwkv_scheduler.score_reviewer_queue_order_async_work(
+                        work,
+                        wait_for_backend=True,
+                    )
+                return aqt.rwkv_scheduler.score_reviewer_queue_order_async_work(work)
+
+            def score_done(
+                score_future: Future[
+                    aqt.rwkv_scheduler.RwkvReviewQueueOrderAsyncResult
+                ],
+            ) -> None:
+                try:
+                    result = score_future.result()
+                except Exception:
+                    logger.exception("RWKV review queue async scoring failed")
+                    finish(installed=False)
+                    return
+
+                def install() -> tuple[bool, tuple[int, int, int] | None]:
+                    installed = (
+                        aqt.rwkv_scheduler.install_reviewer_queue_order_async_result(
+                            self,
+                            result,
+                        )
+                    )
+                    if not installed or remaining_count_card_id is None:
+                        return installed, None
+
+                    try:
+                        queued = cast(
+                            V3Scheduler,
+                            self.mw.col.sched,
+                        ).rebuild_queued_cards_preserving_current_card(
+                            remaining_count_card_id
+                        )
+                        counts = (
+                            queued.new_count,
+                            queued.learning_count,
+                            queued.review_count,
+                        )
+                    except Exception:
+                        logger.exception("RWKV reviewer remaining-count refresh failed")
+                        counts = None
+                    return installed, counts
+
+                def install_done(
+                    install_future: Future[tuple[bool, tuple[int, int, int] | None]],
+                ) -> None:
+                    nonlocal stale_retry_available
+                    try:
+                        installed, counts = install_future.result()
+                    except Exception:
+                        logger.exception("RWKV review queue async install failed")
+                        finish(installed=False)
+                        return
+                    if not installed and stale_retry_available:
+                        stale_retry_available = False
+                        logger.debug(
+                            "retrying required RWKV queue refresh after stale install: "
+                            "reason=%s answered_card_id=%s",
+                            reason,
+                            answered_card_id,
+                        )
+                        start_build()
+                        return
+                    finish(
+                        installed=installed,
+                        counts=counts,
+                    )
+
+                self.mw.taskman.run_in_background(
+                    install,
+                    install_done,
+                    uses_collection=True,
+                )
+
+            self.mw.taskman.run_in_background(
+                score,
+                score_done,
+                uses_collection=False,
+            )
+
+        def start_build() -> None:
+            self.mw.taskman.run_in_background(
+                build_work,
+                build_done,
+                uses_collection=True,
+            )
+
+        start_build()
+
+    def _finish_rwkv_remaining_count_refresh(
+        self,
+        *,
+        card_id: CardId,
+        generation: int,
+        counts: tuple[int, int, int] | None,
+    ) -> None:
+        if generation != getattr(self, "_review_card_generation", 0):
+            return
+        if self.card is None or self.card.id != card_id:
+            return
+
+        self._rwkv_remaining_count_override = (
+            (generation, counts) if counts is not None else None
+        )
+        if self.state != "question":
+            return
+
+        if counts is None:
+            v3 = getattr(self, "_v3", None)
+            if v3 is None:
+                return
+            queued = v3.queued_cards
+            counts = (
+                queued.new_count,
+                queued.learning_count,
+                queued.review_count,
+            )
+        self.bottom.web.eval(
+            f"setRemainingCounts({counts[0]}, {counts[1]}, {counts[2]});"
+        )
+
+    def _run_after_next_question_shown(self, callback: Callable[[], None]) -> None:
+        callbacks = getattr(self, "_rwkv_after_question_shown_callbacks", None)
+        if not isinstance(callbacks, list):
+            callbacks = []
+            self._rwkv_after_question_shown_callbacks = callbacks
+        callbacks.append(callback)
+
+    def _defer_rwkv_queue_order_refresh(
+        self,
+        *,
+        queued_at: float,
+        answered_card_id: CardId,
+    ) -> None:
+        request = _RwkvDeferredQueueRefresh(
+            queued_at=queued_at,
+            answered_card_id=answered_card_id,
+        )
+        self._rwkv_deferred_queue_refresh = request
+
+        def refresh_after_question_shown() -> None:
+            self._run_deferred_rwkv_queue_refresh(
+                request,
+                show_next_card=False,
+            )
+
+        self._run_after_next_question_shown(refresh_after_question_shown)
+
+    def _retry_rwkv_state_recovery(self) -> bool:
+        if getattr(self, "_rwkv_empty_queue_recovery_attempted", False):
+            return False
+        if getattr(self.mw, "state", None) != "review":
+            return False
+
+        generation = self._review_card_generation
+        initial_state = self.state
+        collection = self.mw.col
+        self._rwkv_empty_queue_recovery_attempted = True
+        self._rwkv_empty_queue_recovery_generation = generation
+
+        def is_current() -> bool:
+            return (
+                self._rwkv_empty_queue_recovery_generation == generation
+                and self.mw.state == "review"
+                and self.mw.col is collection
+                and self._rwkv_queue_refresh_target_is_current(
+                    None, initial_state, generation
+                )
+            )
+
+        def show_next(_installed: bool | None) -> None:
+            if is_current():
+                self._rwkv_empty_queue_recovery_generation = None
+                self.nextCard()
+
+        def recovered(ready: bool) -> None:
+            if not is_current():
+                return
+            if ready:
+                self._prepare_rwkv_queue_order_async(
+                    on_finished=show_next,
+                    wait_for_backend=True,
+                )
+            else:
+                show_next(False)
+
+        self.set_review_actions_blocked(True)
+        if aqt.rwkv_scheduler.recover_reviewer_queue_state(self, recovered):
+            logger.debug("reviewer waiting for RWKV state recovery before ending")
+            return True
+        self._rwkv_empty_queue_recovery_generation = None
+        return False
+
+    def _retry_deferred_rwkv_queue_refresh(self) -> bool:
+        request = getattr(self, "_rwkv_deferred_queue_refresh", None)
+        if not isinstance(request, _RwkvDeferredQueueRefresh):
+            return False
+
+        logger.debug(
+            "reviewer fetched no queued card; retrying after deferred RWKV refresh: "
+            "answered_card_id=%s",
+            request.answered_card_id,
+        )
+        return self._run_deferred_rwkv_queue_refresh(request, show_next_card=True)
+
+    def _run_deferred_rwkv_queue_refresh(
+        self,
+        request: _RwkvDeferredQueueRefresh,
+        *,
+        show_next_card: bool,
+    ) -> bool:
+        if getattr(self, "_rwkv_deferred_queue_refresh", None) is not request:
+            return False
+
+        self._rwkv_deferred_queue_refresh = None
+        if show_next_card:
+            self._prepare_empty_rwkv_queue_refresh_then_next_card(request)
+            return True
+
+        self._prepare_rwkv_queue_order_then_next_card(
+            request.queued_at,
+            answered_card_id=request.answered_card_id,
+            refresh_remaining_counts=True,
+        )
+        return True
+
+    def _prepare_empty_rwkv_queue_refresh_then_next_card(
+        self,
+        request: _RwkvDeferredQueueRefresh,
+    ) -> None:
+        initial_state = self.state
+        initial_generation = getattr(self, "_review_card_generation", 0)
+        self._rwkv_empty_queue_refresh = request
+
+        def show_next(_installed: bool | None) -> None:
+            if getattr(self, "_rwkv_empty_queue_refresh", None) is not request:
+                return
+            self._rwkv_empty_queue_refresh = None
+            if self._rwkv_queue_refresh_target_is_current(
+                None,
+                initial_state,
+                initial_generation,
+            ):
+                self.nextCard()
+
+        self._prepare_rwkv_queue_order_async(
+            request.queued_at,
+            answered_card_id=request.answered_card_id,
+            on_finished=show_next,
+            wait_for_backend=True,
+        )
+
+    def _run_after_question_shown_callbacks(self) -> None:
+        callbacks = getattr(self, "_rwkv_after_question_shown_callbacks", None)
+        if not isinstance(callbacks, list) or not callbacks:
+            return
+
+        self._rwkv_after_question_shown_callbacks = []
+        for callback in callbacks:
+            callback()
+
+    def _rwkv_queue_refresh_target_is_current(
+        self,
+        card_id: CardId | None,
+        state: Literal["question", "answer", "transition"] | None,
+        generation: int | None = None,
+    ) -> bool:
+        if generation is not None and generation != getattr(
+            self, "_review_card_generation", 0
+        ):
+            return False
+        if self.state != state:
+            return False
+        if card_id is None:
+            return self.card is None
+        return self.card is not None and self.card.id == card_id
+
+    def _prepare_rwkv_queue_order_on_exit(self) -> None:
+        start = time.monotonic()
+        answered_count = len(self._answeredIds)
+        logger.debug(
+            "reviewer RWKV queue order exit refresh starting: answered_count=%s",
+            answered_count,
+        )
+        self._prepare_rwkv_queue_order_async(
+            answered_card_id=self._answeredIds[-1],
+            reason="review queue exit refresh",
+        )
+        logger.debug(
+            "reviewer RWKV queue order exit refresh queued: "
+            "answered_count=%s elapsed_ms=%.1f",
+            answered_count,
+            (time.monotonic() - start) * 1000,
+        )
 
     # Handlers
     ############################################################
@@ -655,6 +1846,8 @@ class Reviewer:
         gui_hooks.audio_did_seek_relative(self.web, self.seek_secs)
 
     def onEnterKey(self) -> None:
+        if self._review_actions_are_blocked():
+            return
         if self.state == "question":
             self._getTypedAnswer()
         elif self.state == "answer" and aqt.mw.pm.spacebar_rates_card():
@@ -669,6 +1862,69 @@ class Reviewer:
             self._answerCard(val2)
         else:
             self._answerCard(self._defaultEase())
+
+    def _qa_bridge_context(
+        self, url: str, command: str
+    ) -> tuple[Literal["question", "answer"], int, CardId] | None:
+        try:
+            kind, update_id, card_id = url.removeprefix(f"{command}:").split(":")
+            if kind not in ("question", "answer"):
+                return None
+            return cast(
+                tuple[Literal["question", "answer"], int, CardId],
+                (kind, int(update_id), CardId(int(card_id))),
+            )
+        except ValueError:
+            return None
+
+    def _qa_context_is_current(
+        self,
+        kind: Literal["question", "answer"],
+        update_id: int,
+        card_id: CardId,
+    ) -> bool:
+        if self.state != kind or self.card is None or self.card.id != card_id:
+            return False
+        current_update_id = (
+            self._question_update_id if kind == "question" else self._answer_update_id
+        )
+        return current_update_id == update_id
+
+    def _on_qa_paint_pending(
+        self,
+        kind: Literal["question", "answer"],
+        update_id: int,
+        card_id: CardId,
+    ) -> None:
+        if not self._qa_context_is_current(kind, update_id, card_id):
+            return
+        logger.warning(
+            "reviewer paint is pending: card_id=%s side=%s update_id=%s",
+            card_id,
+            kind,
+            update_id,
+        )
+        self.web.update()
+        if callable(repaint := getattr(self.web, "repaint", None)):
+            repaint()
+
+    def _on_qa_paint_retry(
+        self,
+        kind: Literal["question", "answer"],
+        update_id: int,
+        card_id: CardId,
+    ) -> None:
+        if not self._qa_context_is_current(kind, update_id, card_id):
+            return
+        logger.debug(
+            "retrying reviewer paint: card_id=%s side=%s update_id=%s",
+            card_id,
+            kind,
+            update_id,
+        )
+        self.web.update()
+        if callable(repaint := getattr(self.web, "repaint", None)):
+            repaint()
 
     def _linkHandler(self, url: str) -> None:
         if url == "ans":
@@ -689,6 +1945,19 @@ class Reviewer:
             self.web.update()
         elif url == "statesMutated":
             self._states_mutated = True
+        elif url.startswith("qaPaintPending:"):
+            if context := self._qa_bridge_context(url, "qaPaintPending"):
+                self._on_qa_paint_pending(*context)
+        elif url.startswith("qaPaintRetry:"):
+            if context := self._qa_bridge_context(url, "qaPaintRetry"):
+                self._on_qa_paint_retry(*context)
+        elif url.startswith("qaPresented:"):
+            if context := self._qa_bridge_context(url, "qaPresented"):
+                kind, update_id, card_id = context
+                if kind == "question":
+                    self._on_question_rendered(update_id, card_id)
+                else:
+                    self._on_answer_rendered(update_id, card_id)
         else:
             print("unrecognized anki link:", url)
 
@@ -798,9 +2067,33 @@ class Reviewer:
         return self.mw.col.extract_cloze_for_typing(txt, idx) or None
 
     def _getTypedAnswer(self) -> None:
-        self.web.evalWithCallback("getTypedAnswer();", self._onTypedAnswer)
+        if self._review_actions_are_blocked():
+            return
+        if not self._current_question_is_rendered():
+            return
+        card_id = self.card.id if self.card else None
+        question_update_id = self._question_update_id
+        self.web.evalWithCallback(
+            "getTypedAnswer();",
+            lambda val: self._onTypedAnswer(val, card_id, question_update_id),
+        )
 
-    def _onTypedAnswer(self, val: None) -> None:
+    def _onTypedAnswer(
+        self,
+        val: str | None,
+        card_id: CardId | None = None,
+        question_update_id: int | None = None,
+    ) -> None:
+        if self.state != "question" or self.card is None:
+            return
+        if card_id is None:
+            card_id = self.card.id
+        if self.card.id != card_id:
+            return
+        if question_update_id is not None and not self._current_question_is_rendered(
+            question_update_id
+        ):
+            return
         self.typedAnswer = val or ""
         self._showAnswer()
 
@@ -813,7 +2106,7 @@ class Reviewer:
 <table id=innertable width=100%% cellspacing=0 cellpadding=0>
 <tr>
 <td align=start valign=top class=stat>
-<button title="%(editkey)s" onclick="pycmd('edit');">%(edit)s</button></td>
+<button title="%(editkey)s" onclick="pycmd('edit');">%(edit)s<span id=timebox-summary class=stattxt></span></button></td>
 <td align=center valign=top id=middle>
 </td>
 <td align=end valign=top class=stat>
@@ -824,10 +2117,14 @@ class Reviewer:
 </td>
 </tr>
 </table>
+<div id=timebox-progress%(timebox_hidden)s><div></div></div>
 </center>
 <script>
 time = %(time)d;
 timerStopped = false;
+timeboxElapsed = 0;
+timeboxLimit = %(timebox_limit)d;
+timeboxReps = 0;
 </script>
 """ % dict(
             edit=tr.studying_edit(),
@@ -836,6 +2133,8 @@ timerStopped = false;
             morekey=tr.actions_shortcut_key(val="M"),
             downArrow=downArrow(),
             time=self.card.time_taken() // 1000,
+            timebox_limit=self.mw.col.conf["timeLim"],
+            timebox_hidden=" hidden" if not self.mw.col.conf["timeLim"] else "",
         )
 
     def _showAnswerButton(self) -> None:
@@ -855,9 +2154,34 @@ timerStopped = false;
         else:
             maxTime = 0
         self.bottom.web.eval("showQuestion(%s,%d);" % (json.dumps(middle), maxTime))
+        self.bottom.web.eval(
+            "setTimeboxProgress(%d, %d, %d);"
+            % (
+                self._timebox_elapsed_secs(),
+                self.mw.col.conf["timeLim"],
+                self._timebox_reps(),
+            )
+        )
+
+    def _timebox_elapsed_secs(self) -> int:
+        if not self.mw.col.conf["timeLim"]:
+            return 0
+        start = getattr(self.mw.col, "_startTime", None)
+        if start is None:
+            return 0
+        return max(0, int(time.time() - start))
+
+    def _timebox_reps(self) -> int:
+        if not self.mw.col.conf["timeLim"]:
+            return 0
+        reps = self.mw.col.sched.reps
+        start_reps = getattr(self.mw.col, "_startReps", reps)
+        return max(0, reps - start_reps)
 
     def _showEaseButtons(self) -> None:
-        if not self._states_mutated:
+        if not self._states_mutated or not self._ensure_scheduling_states_ready(
+            "answer button rendering"
+        ):
             self.mw.progress.single_shot(50, self._showEaseButtons)
             return
         middle = self._answerButtons()
@@ -873,6 +2197,14 @@ timerStopped = false;
         counts: list[int | str]
         idx, counts_ = self._v3.counts()
         counts = cast(list[Union[int, str]], counts_)
+        count_override = getattr(self, "_rwkv_remaining_count_override", None)
+        if count_override is not None and count_override[0] == getattr(
+            self, "_review_card_generation", 0
+        ):
+            if count_override[1] is None:
+                counts[2] = "…"
+            else:
+                counts[:] = count_override[1]
         counts[idx] = f"<u>{counts[idx]}</u>"
 
         return f"""
@@ -913,6 +2245,23 @@ timerStopped = false;
         default = self._defaultEase()
 
         assert isinstance(self.mw.col.sched, V3Scheduler)
+        current_before_hooks = self._v3.states.current.SerializeToString()
+        current_before_hooks_debug = with_collapsed_whitespace(
+            repr(self._v3.states.current)
+        )
+        self._v3.states = aqt.rwkv_scheduler.update_reviewer_scheduling_states(
+            self._v3.states, self, self.card
+        )
+        self._v3.states = gui_hooks.reviewer_will_update_scheduling_states(
+            self._v3.states, self, self.card
+        )
+        if self._v3.states.current.SerializeToString() != current_before_hooks:
+            logger.warning(
+                "reviewer_will_update_scheduling_states changed current state for card %s: %s -> %s",
+                self.card.id,
+                current_before_hooks_debug,
+                with_collapsed_whitespace(repr(self._v3.states.current)),
+            )
         labels = self.mw.col.sched.describe_next_states(self._v3.states)
 
         def but(i: int, label: str) -> str:
@@ -946,6 +2295,11 @@ timerStopped = false;
     def _buttonTime(self, i: int, v3_labels: Sequence[str]) -> str:
         if self.mw.col.conf["estTimes"]:
             txt = v3_labels[i - 1]
+            txt = re.sub(
+                r" (\([+-]\d+d\))$",
+                r' <span class="fuzz-delta">\1</span>',
+                txt,
+            )
             return f"""<span class="nobold">{txt}</span>"""
         else:
             return ""
@@ -982,6 +2336,9 @@ timerStopped = false;
                 self.mw.moveToState("deckBrowser")
                 return True
             self.mw.col.startTimebox()
+            self.bottom.web.eval(
+                "setTimeboxProgress(0, %d, 0);" % self.mw.col.conf["timeLim"]
+            )
         return False
 
     # Context menu
@@ -1150,18 +2507,20 @@ timerStopped = false;
         bury_notes(
             parent=self.mw,
             note_ids=[self.card.nid],
-        ).success(
-            lambda res: tooltip(tr.studying_cards_buried(count=res.count))
-        ).run_in_background()
+        ).success(self._on_bury_current_succeeded).run_in_background()
 
     def bury_current_card(self) -> None:
         gui_hooks.reviewer_will_bury_card(self.card.id)
         bury_cards(
             parent=self.mw,
             card_ids=[self.card.id],
-        ).success(
-            lambda res: tooltip(tr.studying_cards_buried(count=res.count))
-        ).run_in_background()
+        ).success(self._on_bury_current_succeeded).run_in_background()
+
+    def _on_bury_current_succeeded(self, result: OpChangesWithCount) -> None:
+        # The operation hook runs after this callback. Allow its queue refresh to
+        # advance past a card restored by RWKV-aware undo.
+        self._rwkv_undo_restored_card_active = False
+        tooltip(tr.studying_cards_buried(count=result.count))
 
     def forget_current_card(self) -> None:
         if op := forget_cards(

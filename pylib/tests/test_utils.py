@@ -42,6 +42,9 @@ def test_int_version_to_str(ver, expected):
         ("23.09.1b2", 230901),
         ("23.09.1rc3", 230901),
         ("26.05b1", 260500),
+        ("25.09.4+fsrs7", 250904),
+        ("25.09.4+fsrs7.build.7", 250904),
+        ("2.1.23", 23),
     ],
 )
 def test_int_version(version, expected):
@@ -51,5 +54,11 @@ def test_int_version(version, expected):
 
 def test_int_version_rejects_garbage():
     with patch("anki.buildinfo.version", "not-a-version"):
+        with pytest.raises(ValueError):
+            int_version()
+
+
+def test_int_version_rejects_extra_dotted_segment():
+    with patch("anki.buildinfo.version", "25.09.4.2"):
         with pytest.raises(ValueError):
             int_version()

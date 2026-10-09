@@ -8,6 +8,29 @@ export interface PostProtoOptions {
     signal?: AbortSignal;
 }
 
+export interface PostProtoResponse<T> {
+    output: T;
+    headers: Headers;
+}
+
+function graphDebugLoggingEnabled(): boolean {
+    return typeof location !== "undefined"
+        && new URLSearchParams(location.search).has("graphDebug");
+}
+
+function formatGraphDetails(details: Record<string, unknown>): string {
+    return JSON.stringify(details);
+}
+
+function logGraphPostProto(message: string, details: Record<string, unknown>): void {
+    const text = `${message}: ${formatGraphDetails(details)}`;
+    if (graphDebugLoggingEnabled()) {
+        console.warn(text);
+    } else {
+        console.debug(text);
+    }
+}
+
 export async function postProto<T>(
     method: string,
     input: { toBinary(): Uint8Array; getType(): { typeName: string } },
@@ -15,13 +38,57 @@ export async function postProto<T>(
     options: PostProtoOptions = {},
     opChangesType = 0,
 ): Promise<T> {
-    const { alertOnError = true, signal = undefined } = options;
+    const { output } = await postProtoWithResponse(method, input, outputType, options, opChangesType);
+    return output;
+}
+
+export async function postProtoWithResponse<T>(
+    method: string,
+    input: { toBinary(): Uint8Array; getType(): { typeName: string } },
+    outputType: { fromBinary(arr: Uint8Array): T },
+    options: PostProtoOptions = {},
+    opChangesType = 0,
+): Promise<PostProtoResponse<T>> {
     try {
+        const start = performance.now();
         const inputBytes = input.toBinary();
         const path = `/_anki/${method}`;
-        const outputBytes = await postProtoInner(path, inputBytes, opChangesType, signal);
-        return outputType.fromBinary(outputBytes);
+        if (method === "graphs") {
+            logGraphPostProto("graphs postProto request body encoded", {
+                inputBytes: inputBytes.length,
+                elapsedMs: performance.now() - start,
+            });
+        }
+        const response = await postProtoInner(path, inputBytes, opChangesType, options.signal);
+        const outputBytes = response.body;
+        const fetchElapsedMs = performance.now() - start;
+        if (method === "graphs") {
+            logGraphPostProto("graphs postProto body received", {
+                outputBytes: outputBytes.length,
+                fetchElapsedMs,
+            });
+        }
+        const decodeStart = performance.now();
+        if (method === "graphs") {
+            logGraphPostProto("graphs postProto decode started", {
+                outputBytes: outputBytes.length,
+                elapsedMs: performance.now() - start,
+            });
+        }
+        const output = outputType.fromBinary(outputBytes);
+        const decodeElapsedMs = performance.now() - decodeStart;
+        if (method === "graphs") {
+            logGraphPostProto("graphs postProto decoded", {
+                inputBytes: inputBytes.length,
+                outputBytes: outputBytes.length,
+                fetchElapsedMs,
+                decodeElapsedMs,
+                elapsedMs: performance.now() - start,
+            });
+        }
+        return { output, headers: response.headers };
     } catch (err) {
+        const { alertOnError = true } = options;
         if (
             alertOnError && !(err instanceof Error && (err.message === "500: Interrupted" || err.name === "AbortError"))
         ) {
@@ -31,18 +98,38 @@ export async function postProto<T>(
     }
 }
 
+interface PostProtoInnerResponse {
+    body: Uint8Array;
+    headers: Headers;
+}
+
 async function postProtoInner(
     url: string,
     body: Uint8Array,
     opChangesType: number,
     signal?: AbortSignal,
-): Promise<Uint8Array> {
+): Promise<PostProtoInnerResponse> {
+    const start = performance.now();
+    const graphRequest = url === "/_anki/graphs";
+    if (graphRequest) {
+        logGraphPostProto("graphs fetch started", {
+            bodyBytes: body.length,
+        });
+    }
     const result = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/binary", "Anki-Op-Changes": opChangesType.toString() },
         body,
         signal,
     });
+    if (graphRequest) {
+        logGraphPostProto("graphs fetch response headers received", {
+            status: result.status,
+            ok: result.ok,
+            contentLength: result.headers.get("content-length"),
+            elapsedMs: performance.now() - start,
+        });
+    }
     if (!result.ok) {
         let msg = "something went wrong";
         try {
@@ -52,7 +139,17 @@ async function postProtoInner(
         }
         throw new Error(process.env.NODE_ENV === "production" ? `${msg}` : `${result.status}: ${msg}`);
     }
-    const blob = await result.blob();
-    const respBuf = await new Response(blob).arrayBuffer();
-    return new Uint8Array(respBuf);
+    if (graphRequest) {
+        logGraphPostProto("graphs fetch body read started", {
+            elapsedMs: performance.now() - start,
+        });
+    }
+    const respBuf = await result.arrayBuffer();
+    if (graphRequest) {
+        logGraphPostProto("graphs fetch body read finished", {
+            bytes: respBuf.byteLength,
+            elapsedMs: performance.now() - start,
+        });
+    }
+    return { body: new Uint8Array(respBuf), headers: result.headers };
 }

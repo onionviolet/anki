@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-GH_REPO = ["--repo", "ankitects/anki"]
+GH_REPO = ["--repo", "JSchoreels/anki"]
 
 
 @dataclass

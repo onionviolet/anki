@@ -67,7 +67,7 @@ import logging
 import os
 import time
 import weakref
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 
 import anki.latex
 from anki import hooks
@@ -101,6 +101,8 @@ anki.latex.setup_hook()
 logger = logging.getLogger(__name__)
 
 SearchJoiner = Literal["AND", "OR"]
+FsrsPresetVersion = Literal["seven", "six", "five", "four"]
+FSRS_PRESET_OVERLAY_CONFIG_KEY = "fsrsPresetOverlay"
 
 
 @dataclass
@@ -125,8 +127,163 @@ ExportLimit = Union[DeckIdLimit, NoteIdsLimit, CardIdsLimit, None]
 class ComputedMemoryState:
     desired_retention: float
     stability: float | None = None
+    stability_internal: float | None = None
     difficulty: float | None = None
     decay: float | None = None
+
+
+@dataclass
+class AddonFsrsPreset:
+    id: str
+    name: str
+    fsrs_version: FsrsPresetVersion
+    params: Sequence[float]
+    desired_retention: float
+    historical_retention: float
+    ignore_revlogs_before_date: str = ""
+    fsrs_dynamic_desired_retention_enabled: bool = False
+    fsrs_dynamic_desired_retention_params: Sequence[float] = field(default_factory=list)
+    fsrs_dynamic_desired_retention_weights: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_avg_drs: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_fsrs_eq_weights: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_fsrs_eq_drs: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_fixed_target_weights: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_fixed_target_drs: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_min: float = 0.0
+    fsrs_dynamic_desired_retention_max: float = 0.0
+    fsrs_dynamic_desired_retention_clamp: bool = False
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> AddonFsrsPreset:
+        return AddonFsrsPreset(
+            id=data["id"],
+            name=data["name"],
+            fsrs_version=data.get("fsrs_version", "seven"),
+            params=data["params"],
+            desired_retention=data["desired_retention"],
+            historical_retention=data["historical_retention"],
+            ignore_revlogs_before_date=data.get("ignore_revlogs_before_date", ""),
+            fsrs_dynamic_desired_retention_enabled=data.get(
+                "fsrs_dynamic_desired_retention_enabled", False
+            ),
+            fsrs_dynamic_desired_retention_params=data.get(
+                "fsrs_dynamic_desired_retention_params", []
+            ),
+            fsrs_dynamic_desired_retention_weights=data.get(
+                "fsrs_dynamic_desired_retention_weights", []
+            ),
+            fsrs_dynamic_desired_retention_avg_drs=data.get(
+                "fsrs_dynamic_desired_retention_avg_drs", []
+            ),
+            fsrs_dynamic_desired_retention_fsrs_eq_weights=data.get(
+                "fsrs_dynamic_desired_retention_fsrs_eq_weights", []
+            ),
+            fsrs_dynamic_desired_retention_fsrs_eq_drs=data.get(
+                "fsrs_dynamic_desired_retention_fsrs_eq_drs", []
+            ),
+            fsrs_dynamic_desired_retention_fixed_target_weights=data.get(
+                "fsrs_dynamic_desired_retention_fixed_target_weights", []
+            ),
+            fsrs_dynamic_desired_retention_fixed_target_drs=data.get(
+                "fsrs_dynamic_desired_retention_fixed_target_drs", []
+            ),
+            fsrs_dynamic_desired_retention_min=data.get(
+                "fsrs_dynamic_desired_retention_min", 0.0
+            ),
+            fsrs_dynamic_desired_retention_max=data.get(
+                "fsrs_dynamic_desired_retention_max", 0.0
+            ),
+            fsrs_dynamic_desired_retention_clamp=data.get(
+                "fsrs_dynamic_desired_retention_clamp", False
+            ),
+        )
+
+
+@dataclass
+class ResolvedFsrsPreset:
+    id: str
+    name: str
+    fsrs_version: FsrsPresetVersion
+    params: Sequence[float]
+    desired_retention: float
+    historical_retention: float
+    ignore_revlogs_before_date: str = ""
+    fsrs_dynamic_desired_retention_enabled: bool = False
+    fsrs_dynamic_desired_retention_params: Sequence[float] = field(default_factory=list)
+    fsrs_dynamic_desired_retention_weights: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_avg_drs: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_fsrs_eq_weights: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_fsrs_eq_drs: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_fixed_target_weights: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_fixed_target_drs: Sequence[float] = field(
+        default_factory=list
+    )
+    fsrs_dynamic_desired_retention_min: float = 0.0
+    fsrs_dynamic_desired_retention_max: float = 0.0
+    fsrs_dynamic_desired_retention_clamp: bool = False
+
+
+@dataclass
+class FsrsDesiredRetentionForInterval:
+    interval_target_desired_retention: float
+    dynamic_desired_retention_enabled: bool = False
+    dynamic_desired_retentions: Sequence[float] = field(default_factory=list)
+
+
+def _fsrs_version_name(version: int) -> FsrsPresetVersion:
+    versions: tuple[FsrsPresetVersion, ...] = ("seven", "six", "five", "four")
+    return versions[version]
+
+
+@dataclass
+class FsrsPresetRule:
+    search: str
+    preset_id: str
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> FsrsPresetRule:
+        return FsrsPresetRule(search=data["search"], preset_id=data["preset_id"])
+
+
+@dataclass
+class FsrsPresetOverlay:
+    presets: Sequence[AddonFsrsPreset]
+    rules: Sequence[FsrsPresetRule]
+
+    @staticmethod
+    def from_dict(data: dict[str, Any] | None) -> FsrsPresetOverlay:
+        data = data or {}
+        return FsrsPresetOverlay(
+            presets=[
+                AddonFsrsPreset.from_dict(preset) for preset in data.get("presets", [])
+            ],
+            rules=[FsrsPresetRule.from_dict(rule) for rule in data.get("rules", [])],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -932,6 +1089,24 @@ class Collection(DeprecatedNamesMixin):
             key=key, value_json=to_json_bytes(val), undoable=undoable
         )
 
+    def get_fsrs_preset_overlay(self) -> FsrsPresetOverlay:
+        """Return add-on-provided FSRS presets and card matching rules."""
+        return FsrsPresetOverlay.from_dict(
+            self.get_config(FSRS_PRESET_OVERLAY_CONFIG_KEY)
+        )
+
+    def set_fsrs_preset_overlay(
+        self, overlay: FsrsPresetOverlay, *, undoable: bool = False
+    ) -> OpChanges:
+        """Set add-on-provided FSRS presets and card matching rules.
+
+        The backend validates add-on preset ids, FSRS params, search syntax, and
+        disallows FSRS metric properties in rules.
+        """
+        return self.set_config(
+            FSRS_PRESET_OVERLAY_CONFIG_KEY, overlay.to_dict(), undoable=undoable
+        )
+
     def remove_config(self, key: str) -> OpChanges:
         return self.conf.remove(key)
 
@@ -1036,6 +1211,48 @@ class Collection(DeprecatedNamesMixin):
         https://ankiweb.net/shared/info/2179254157
         """
         return self._backend.card_stats(card_id)
+
+    def card_memory_metrics(
+        self, card_ids: Sequence[CardId], *, include_retrievability: bool = True
+    ) -> Sequence[stats_pb2.CardMemoryMetrics]:
+        """Read current FSRS state without generating full card statistics.
+
+        Missing cards are omitted; order and duplicates are otherwise preserved.
+        Missing memory state remains absent, including on reviewed cards. Use
+        card_stats_data() when its missing-state initialization is required.
+        Set include_retrievability=False to read stored state/retention only.
+        """
+        return self._backend.card_memory_metrics(
+            card_ids=card_ids, include_retrievability=include_retrievability
+        )
+
+    def card_details(
+        self,
+        card_ids: Sequence[CardId],
+        *,
+        include_memory_state: bool = False,
+        include_retrievability: bool = False,
+        note_fields: Sequence[str] | None = None,
+    ) -> Sequence[stats_pb2.CardDetails]:
+        """Read scheduling fields, selected note values and optional current metrics.
+
+        Missing cards are omitted; order and duplicates are preserved. None skips
+        note access, while [] requests an empty field selection. Absent note_fields
+        in a returned entry signals a missing note/type/selected field. Missing
+        memory state is never initialized; use card_stats_data() when required.
+        """
+        return self._backend.card_details(
+            stats_pb2.CardDetailsRequest(
+                card_ids=card_ids,
+                include_memory_state=include_memory_state,
+                include_retrievability=include_retrievability,
+                note_fields=(
+                    stats_pb2.NoteFieldSelection(names=note_fields)
+                    if note_fields is not None
+                    else None
+                ),
+            )
+        )
 
     def get_review_logs(
         self, card_id: CardId
@@ -1203,9 +1420,15 @@ class Collection(DeprecatedNamesMixin):
     def compute_memory_state(self, card_id: CardId) -> ComputedMemoryState:
         resp = self._backend.compute_memory_state(card_id)
         if resp.HasField("state"):
+            stability_internal = (
+                resp.state.stability_internal
+                if resp.state.HasField("stability_internal")
+                else resp.state.stability
+            )
             return ComputedMemoryState(
                 desired_retention=resp.desired_retention,
                 stability=resp.state.stability,
+                stability_internal=stability_internal,
                 difficulty=resp.state.difficulty,
                 decay=resp.decay,
             )
@@ -1218,6 +1441,160 @@ class Collection(DeprecatedNamesMixin):
     def fuzz_delta(self, card_id: CardId, interval: int) -> int:
         "The delta days of fuzz applied if reviewing the card in v3."
         return self._backend.fuzz_delta(card_id=card_id, interval=interval)
+
+    def fsrs_current_retrievability(
+        self, card_id: CardId, stability: float, elapsed_days: float
+    ) -> float:
+        return self._backend.fsrs_current_retrievability(
+            card_id=card_id,
+            stability=stability,
+            elapsed_days=elapsed_days,
+        )
+
+    def fsrs_next_interval(
+        self, card_id: CardId, stability: float, desired_retention: float
+    ) -> float:
+        """Return the interval for a displayed stability (S90) and retention."""
+        return self._backend.fsrs_next_interval(
+            card_id=card_id,
+            stability=stability,
+            desired_retention=desired_retention,
+        )
+
+    def fsrs_preset_for_card(self, card_id: CardId) -> ResolvedFsrsPreset:
+        """Return the FSRS preset Anki resolves for this card."""
+        resp = self._backend.get_fsrs_preset_for_card(card_id)
+        return ResolvedFsrsPreset(
+            id=resp.id,
+            name=resp.name,
+            fsrs_version=_fsrs_version_name(resp.fsrs_version),
+            params=resp.params,
+            desired_retention=resp.desired_retention,
+            historical_retention=resp.historical_retention,
+            ignore_revlogs_before_date=resp.ignore_revlogs_before_date,
+            fsrs_dynamic_desired_retention_enabled=(
+                resp.fsrs_dynamic_desired_retention_enabled
+            ),
+            fsrs_dynamic_desired_retention_params=(
+                resp.fsrs_dynamic_desired_retention_params
+            ),
+            fsrs_dynamic_desired_retention_weights=(
+                resp.fsrs_dynamic_desired_retention_weights
+            ),
+            fsrs_dynamic_desired_retention_avg_drs=(
+                resp.fsrs_dynamic_desired_retention_avg_drs
+            ),
+            fsrs_dynamic_desired_retention_fsrs_eq_weights=(
+                resp.fsrs_dynamic_desired_retention_fsrs_eq_weights
+            ),
+            fsrs_dynamic_desired_retention_fsrs_eq_drs=(
+                resp.fsrs_dynamic_desired_retention_fsrs_eq_drs
+            ),
+            fsrs_dynamic_desired_retention_fixed_target_weights=(
+                resp.fsrs_dynamic_desired_retention_fixed_target_weights
+            ),
+            fsrs_dynamic_desired_retention_fixed_target_drs=(
+                resp.fsrs_dynamic_desired_retention_fixed_target_drs
+            ),
+            fsrs_dynamic_desired_retention_min=(
+                resp.fsrs_dynamic_desired_retention_min
+            ),
+            fsrs_dynamic_desired_retention_max=(
+                resp.fsrs_dynamic_desired_retention_max
+            ),
+            fsrs_dynamic_desired_retention_clamp=(
+                resp.fsrs_dynamic_desired_retention_clamp
+            ),
+        )
+
+    def fsrs_interval_at_retrievability(
+        self, card_id: CardId, stability: float, target_retrievability: float
+    ) -> float:
+        return self._backend.fsrs_interval_at_retrievability(
+            card_id=card_id,
+            stability=stability,
+            target_retrievability=target_retrievability,
+        )
+
+    def fsrs_interval_at_retrievability_batch(
+        self, items: Sequence[tuple[CardId, float]], target_retrievability: float
+    ) -> dict[CardId, float]:
+        req_items = [
+            scheduler_pb2.FsrsIntervalAtRetrievabilityBatchRequest.Item(
+                card_id=card_id,
+                stability=stability,
+            )
+            for card_id, stability in items
+        ]
+        resp_items = self._backend.fsrs_interval_at_retrievability_batch(
+            items=req_items,
+            target_retrievability=target_retrievability,
+        )
+        return {CardId(item.card_id): item.interval for item in resp_items}
+
+    def fsrs_interval_at_retrievability_variable_batch(
+        self, items: Sequence[tuple[CardId, float, float]]
+    ) -> list[float]:
+        req_items = [
+            scheduler_pb2.FsrsIntervalAtRetrievabilityVariableBatchRequest.Item(
+                request_index=i,
+                card_id=card_id,
+                stability=stability,
+                target_retrievability=target_retrievability,
+            )
+            for i, (card_id, stability, target_retrievability) in enumerate(items)
+        ]
+        resp_items = self._backend.fsrs_interval_at_retrievability_variable_batch(
+            items=req_items,
+        )
+        by_index = {item.request_index: item.interval for item in resp_items}
+        return [by_index[i] for i in range(len(items))]
+
+    def fsrs_desired_retention_for_intervals_batch(
+        self, items: Sequence[tuple[CardId, float]]
+    ) -> list[FsrsDesiredRetentionForInterval]:
+        req_items = [
+            scheduler_pb2.FsrsDesiredRetentionForIntervalsBatchRequest.Item(
+                request_index=i,
+                card_id=card_id,
+                desired_retention=desired_retention,
+            )
+            for i, (card_id, desired_retention) in enumerate(items)
+        ]
+        resp_items = self._backend.fsrs_desired_retention_for_intervals_batch(
+            items=req_items,
+        )
+        by_index = {
+            item.request_index: FsrsDesiredRetentionForInterval(
+                interval_target_desired_retention=(
+                    item.interval_target_desired_retention
+                ),
+                dynamic_desired_retention_enabled=(
+                    item.dynamic_desired_retention_enabled
+                ),
+                dynamic_desired_retentions=item.dynamic_desired_retentions,
+            )
+            for item in resp_items
+        }
+        return [by_index[i] for i in range(len(items))]
+
+    def fsrs_interval_at_retrievability_by_config_batch(
+        self, items: Sequence[tuple[int, float]], target_retrievability: float
+    ) -> list[float]:
+        req_items = [
+            scheduler_pb2.FsrsIntervalAtRetrievabilityByConfigBatchRequest.Item(
+                request_index=i,
+                config_id=config_id,
+                stability=stability,
+            )
+            for i, (config_id, stability) in enumerate(items)
+        ]
+        resp_items = self._backend.fsrs_interval_at_retrievability_by_config_batch(
+            items=req_items,
+            target_retrievability=target_retrievability,
+        )
+        by_index = {item.request_index: item.interval for item in resp_items}
+        return [by_index[i] for i in range(len(items))]
 
     # Timeboxing
     ##########################################################################

@@ -2,14 +2,21 @@
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 import type { PlainMessage } from "@bufbuild/protobuf";
+import { OpChanges } from "@generated/anki/collection_pb";
 import type {
     DeckConfigsForUpdate,
     DeckConfigsForUpdate_CurrentDeck,
     UpdateDeckConfigsMode,
+} from "@generated/anki/deck_config_pb";
+import {
+    DeckConfig,
+    DeckConfig_Config,
+    DeckConfig_Config_FsrsVersion,
+    DeckConfigsForUpdate_CurrentDeck_Limits,
     UpdateDeckConfigsRequest,
 } from "@generated/anki/deck_config_pb";
-import { DeckConfig, DeckConfig_Config, DeckConfigsForUpdate_CurrentDeck_Limits } from "@generated/anki/deck_config_pb";
 import { updateDeckConfigs } from "@generated/backend";
+import { postProto } from "@generated/post";
 import { localeCompare } from "@tslib/i18n";
 import { promiseWithResolver } from "@tslib/promise";
 import { cloneDeep, isEqual, isEqualWith } from "lodash-es";
@@ -18,6 +25,8 @@ import type { Readable, Writable } from "svelte/store";
 import { get, readable, writable } from "svelte/store";
 
 import type { DynamicSvelteComponent } from "$lib/sveltelib/dynamicComponent";
+
+import { fsrsParamDiagnostics } from "./fsrs-param-diagnostics";
 
 export type DeckOptionsId = bigint;
 
@@ -34,6 +43,16 @@ export interface ConfigListEntry {
     current: boolean;
 }
 
+async function updateDeckConfigsAndClose(
+    input: PlainMessage<UpdateDeckConfigsRequest>,
+): Promise<void> {
+    await postProto(
+        "updateDeckConfigsAndClose",
+        new UpdateDeckConfigsRequest(input),
+        OpChanges,
+    );
+}
+
 type AllConfigs =
     & Required<
         Pick<
@@ -42,9 +61,17 @@ type AllConfigs =
             | "cardStateCustomizer"
             | "limits"
             | "newCardsIgnoreReviewLimit"
+            | "loadBalancerEnabled"
+            | "fsrsShortTermWithStepsEnabled"
+            | "fsrsLearningQueuesDisabled"
             | "applyAllParentLimits"
             | "fsrs"
             | "fsrsReschedule"
+            | "reviewFuzzEnabled"
+            | "reviewFuzzBase"
+            | "reviewFuzzFactorShort"
+            | "reviewFuzzFactorMid"
+            | "reviewFuzzFactorLong"
         >
     >
     & { currentConfig: DeckConfig_Config };
@@ -59,10 +86,18 @@ export class DeckOptionsState {
     readonly defaults: DeckConfig_Config;
     readonly addonComponents: Writable<DynamicSvelteComponent[]>;
     readonly newCardsIgnoreReviewLimit: Writable<boolean>;
+    readonly loadBalancerEnabled: Writable<boolean>;
     readonly applyAllParentLimits: Writable<boolean>;
     readonly fsrs: Writable<boolean>;
+    readonly fsrsShortTermWithStepsEnabled: Writable<boolean>;
+    readonly fsrsLearningQueuesDisabled: Writable<boolean>;
     readonly fsrsReschedule: Writable<boolean> = writable(false);
     readonly fsrsHealthCheck: Writable<boolean>;
+    readonly reviewFuzzEnabled: Writable<boolean>;
+    readonly reviewFuzzBase: Writable<number>;
+    readonly reviewFuzzFactorShort: Writable<number>;
+    readonly reviewFuzzFactorMid: Writable<number>;
+    readonly reviewFuzzFactorLong: Writable<number>;
     readonly legacyEvaluate: boolean;
     readonly daysSinceLastOptimization: Writable<number>;
     readonly currentPresetName: Writable<string>;
@@ -103,9 +138,19 @@ export class DeckOptionsState {
         this.cardStateCustomizer = writable(data.cardStateCustomizer);
         this.deckLimits = writable(data.currentDeck?.limits ?? createLimits());
         this.newCardsIgnoreReviewLimit = writable(data.newCardsIgnoreReviewLimit);
+        this.loadBalancerEnabled = writable(data.loadBalancerEnabled);
         this.applyAllParentLimits = writable(data.applyAllParentLimits);
         this.fsrs = writable(data.fsrs);
+        this.fsrsShortTermWithStepsEnabled = writable(
+            data.fsrsShortTermWithStepsEnabled,
+        );
+        this.fsrsLearningQueuesDisabled = writable(data.fsrsLearningQueuesDisabled);
         this.fsrsHealthCheck = writable(data.fsrsHealthCheck);
+        this.reviewFuzzEnabled = writable(data.reviewFuzzEnabled);
+        this.reviewFuzzBase = writable(data.reviewFuzzBase);
+        this.reviewFuzzFactorShort = writable(data.reviewFuzzFactorShort);
+        this.reviewFuzzFactorMid = writable(data.reviewFuzzFactorMid);
+        this.reviewFuzzFactorLong = writable(data.reviewFuzzFactorLong);
         this.legacyEvaluate = data.fsrsLegacyEvaluate;
         this.daysSinceLastOptimization = writable(data.daysSinceLastFsrsOptimize);
 
@@ -157,7 +202,9 @@ export class DeckOptionsState {
             const idx = original.configs.findIndex((conf) => conf.id === id);
             // this should never be -1, since new presets are excluded, and removed presets aren't considered
             if (idx !== -1) {
-                original.configs[idx] = cloneDeep(this.configs[this.selectedIdx].config);
+                original.configs[idx] = cloneDeep(
+                    this.configs[this.selectedIdx].config,
+                );
             }
         }
     }
@@ -177,7 +224,60 @@ export class DeckOptionsState {
     }
 
     getCurrentNameForSearch(): string {
-        return this.getCurrentName().replace(/([\\"])/g, "\\$1");
+        return escapeSearchText(this.getCurrentName());
+    }
+
+    getCurrentDeckNameForSearch(): string {
+        return escapeSearchText(this.currentDeck.name);
+    }
+
+    getTargetDeckId(): DeckOptionsId {
+        return this.targetDeckId;
+    }
+
+    getCurrentConfigId(): DeckOptionsId {
+        return this.configs[this.selectedIdx].config.id;
+    }
+
+    getSubtreeConfigIds(): bigint[] {
+        return this.currentDeck.subtreeConfigIds;
+    }
+
+    getConfigById(id: DeckConfig["id"]): DeckConfig | undefined {
+        return this.configs.find((c) => c.config.id === id)?.config;
+    }
+
+    incompatibleFsrsParamPresetNames(): string[] {
+        return this.configs.flatMap(({ config }) => {
+            const inner = config.config;
+            if (!inner || fsrsParamDiagnostics(selectedFsrsParams(inner)).valid) {
+                return [];
+            }
+
+            return [config.name];
+        });
+    }
+
+    clearIncompatibleFsrsParams(): number {
+        let cleared = 0;
+        for (const config of this.configs.map((c) => c.config)) {
+            const inner = config.config;
+            if (!inner || fsrsParamDiagnostics(selectedFsrsParams(inner)).valid) {
+                continue;
+            }
+
+            config.config = withSelectedFsrsParams(inner, []);
+            if (config.id) {
+                this.modifiedConfigs.add(config.id);
+            }
+            cleared += 1;
+        }
+
+        if (cleared) {
+            this.updateCurrentConfig();
+        }
+
+        return cleared;
     }
 
     setCurrentName(name: string): void {
@@ -244,9 +344,7 @@ export class DeckOptionsState {
         this.setCurrentIndex(newIdx);
     }
 
-    dataForSaving(
-        mode: UpdateDeckConfigsMode,
-    ): PlainMessage<UpdateDeckConfigsRequest> {
+    dataForSaving(mode: UpdateDeckConfigsMode): PlainMessage<UpdateDeckConfigsRequest> {
         const modifiedConfigsExcludingCurrent = this.configs
             .map((c) => c.config)
             .filter((c, idx) => {
@@ -268,10 +366,18 @@ export class DeckOptionsState {
             cardStateCustomizer: get(this.cardStateCustomizer),
             limits: get(this.deckLimits),
             newCardsIgnoreReviewLimit: get(this.newCardsIgnoreReviewLimit),
+            loadBalancerEnabled: get(this.loadBalancerEnabled),
             applyAllParentLimits: get(this.applyAllParentLimits),
             fsrs: get(this.fsrs),
+            fsrsShortTermWithStepsEnabled: get(this.fsrsShortTermWithStepsEnabled),
+            fsrsLearningQueuesDisabled: get(this.fsrsLearningQueuesDisabled),
             fsrsReschedule: get(this.fsrsReschedule),
             fsrsHealthCheck: get(this.fsrsHealthCheck),
+            reviewFuzzEnabled: get(this.reviewFuzzEnabled),
+            reviewFuzzBase: get(this.reviewFuzzBase),
+            reviewFuzzFactorShort: get(this.reviewFuzzFactorShort),
+            reviewFuzzFactorMid: get(this.reviewFuzzFactorMid),
+            reviewFuzzFactorLong: get(this.reviewFuzzFactorLong),
         };
     }
 
@@ -279,10 +385,13 @@ export class DeckOptionsState {
         return this._presetAssignmentsChanged;
     }
 
-    async save(mode: UpdateDeckConfigsMode): Promise<void> {
-        await updateDeckConfigs(
-            this.dataForSaving(mode),
-        );
+    async save(mode: UpdateDeckConfigsMode, closeOnSuccess = false): Promise<void> {
+        const request = this.dataForSaving(mode);
+        if (closeOnSuccess) {
+            await updateDeckConfigsAndClose(request);
+        } else {
+            await updateDeckConfigs(request);
+        }
     }
 
     private onCurrentConfigChanged(config: DeckConfig_Config): void {
@@ -359,13 +468,21 @@ export class DeckOptionsState {
 
     private getAllConfigs(): AllConfigs {
         return cloneDeep({
-            configs: this.configs.map(c => c.config),
+            configs: this.configs.map((c) => c.config),
             cardStateCustomizer: get(this.cardStateCustomizer),
             limits: get(this.deckLimits),
             newCardsIgnoreReviewLimit: get(this.newCardsIgnoreReviewLimit),
+            loadBalancerEnabled: get(this.loadBalancerEnabled),
             applyAllParentLimits: get(this.applyAllParentLimits),
             fsrs: get(this.fsrs),
+            fsrsShortTermWithStepsEnabled: get(this.fsrsShortTermWithStepsEnabled),
+            fsrsLearningQueuesDisabled: get(this.fsrsLearningQueuesDisabled),
             fsrsReschedule: get(this.fsrsReschedule),
+            reviewFuzzEnabled: get(this.reviewFuzzEnabled),
+            reviewFuzzBase: get(this.reviewFuzzBase),
+            reviewFuzzFactorShort: get(this.reviewFuzzFactorShort),
+            reviewFuzzFactorMid: get(this.reviewFuzzFactorMid),
+            reviewFuzzFactorLong: get(this.reviewFuzzFactorLong),
             currentConfig: get(this.currentConfig),
         });
     }
@@ -414,6 +531,10 @@ function bytesToObject(bytes: Uint8Array): Record<string, unknown> {
 
 export function createLimits(): DeckConfigsForUpdate_CurrentDeck_Limits {
     return new DeckConfigsForUpdate_CurrentDeck_Limits({});
+}
+
+export function escapeSearchText(text: string): string {
+    return text.replace(/([\\"])/g, "\\$1");
 }
 
 export class ValueTab {
@@ -465,12 +586,87 @@ export async function commitEditing(): Promise<void> {
     await tick();
 }
 
-export function fsrsParams(config: DeckConfig_Config): number[] {
-    if (config.fsrsParams6) {
+function fsrsParamsUsable(params: number[] | undefined): params is number[] {
+    if (!params || params.length === 0) {
+        return false;
+    }
+    if (![17, 19, 21, 34].includes(params.length)) {
+        return false;
+    }
+    return params.every((w) => Number.isFinite(w));
+}
+
+function selectedFsrsParams(config: DeckConfig_Config): number[] {
+    switch (config.fsrsVersion) {
+        case DeckConfig_Config_FsrsVersion.SIX:
+            return config.fsrsParams6;
+        case DeckConfig_Config_FsrsVersion.FIVE:
+            return config.fsrsParams5;
+        case DeckConfig_Config_FsrsVersion.FOUR:
+            return config.fsrsParams4;
+        default:
+            return config.fsrsParams7;
+    }
+}
+
+export function fsrsParamsForEvaluation(
+    config: DeckConfig_Config,
+    defaults: DeckConfig_Config,
+): number[] {
+    const params = selectedFsrsParams(config);
+    // The legacy evaluation API preserves empty arrays as FSRS-6 defaults;
+    // resolve FSRS-7 defaults explicitly when that version is selected.
+    return config.fsrsVersion === DeckConfig_Config_FsrsVersion.SEVEN && params.length === 0
+        ? defaults.fsrsParams7
+        : params;
+}
+
+export function withSelectedFsrsParams(
+    config: DeckConfig_Config,
+    params: number[],
+): DeckConfig_Config {
+    const updated = new DeckConfig_Config(config);
+    switch (updated.fsrsVersion) {
+        case DeckConfig_Config_FsrsVersion.SIX:
+            updated.fsrsParams6 = [...params];
+            break;
+        case DeckConfig_Config_FsrsVersion.FIVE:
+            updated.fsrsParams5 = [...params];
+            break;
+        case DeckConfig_Config_FsrsVersion.FOUR:
+            updated.fsrsParams4 = [...params];
+            break;
+        default:
+            updated.fsrsParams7 = [...params];
+            break;
+    }
+    return updated;
+}
+
+export function fsrsParams(
+    config: DeckConfig_Config,
+    defaults?: DeckConfig_Config,
+): number[] {
+    const selected = selectedFsrsParams(config);
+    if (config.fsrsVersion === DeckConfig_Config_FsrsVersion.SEVEN) {
+        if (selected.length === 34 && fsrsParamsUsable(selected)) {
+            return selected;
+        }
+        const defaultParams = defaults?.fsrsParams7;
+        return defaultParams?.length === 34 && fsrsParamsUsable(defaultParams)
+            ? defaultParams
+            : [];
+    } else if (fsrsParamsUsable(selected)) {
+        return selected;
+    } else if (fsrsParamsUsable(config.fsrsParams7)) {
+        return config.fsrsParams7;
+    } else if (fsrsParamsUsable(config.fsrsParams6)) {
         return config.fsrsParams6;
-    } else if (config.fsrsParams5) {
+    } else if (fsrsParamsUsable(config.fsrsParams5)) {
         return config.fsrsParams5;
-    } else {
+    } else if (fsrsParamsUsable(config.fsrsParams4)) {
         return config.fsrsParams4;
+    } else {
+        return [];
     }
 }

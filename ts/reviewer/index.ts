@@ -20,11 +20,13 @@ import { bridgeCommand } from "@tslib/bridgecommand";
 import { registerPackage } from "@tslib/runtime-require";
 
 import { allImagesLoaded, preloadAnswerImages } from "./images";
+import { waitForNextPaint } from "./paint";
 import { preloadResources } from "./preload";
 
 declare const MathJax: any;
 
-let mathjaxLoading: Promise<void> | null = window?.["MathJax"]?.startup?.promise ?? null;
+// Preview and card layout windows load MathJax before the reviewer script.
+let mathjaxLoading: Promise<void> | null = typeof MathJax === "undefined" ? null : MathJax.startup?.promise ?? null;
 
 function _lazyLoadMathJax(): Promise<void> {
     return mathjaxLoading || (mathjaxLoading = new Promise((resolve, reject) => {
@@ -79,6 +81,34 @@ function _runHook(
 }
 
 let _updatingQueue: Promise<void> = Promise.resolve();
+let latestUpdateContext: string | undefined;
+
+function setLatestUpdateContext(updateContext: string): void {
+    latestUpdateContext = updateContext;
+}
+
+export function _setQAInteractionEnabled(enabled: boolean): void {
+    const qa = document.getElementById("qa");
+    if (!qa) {
+        return;
+    }
+    qa.toggleAttribute("inert", !enabled);
+    if (enabled) {
+        qa.removeAttribute("aria-busy");
+    } else {
+        qa.setAttribute("aria-busy", "true");
+    }
+}
+
+export function _clearQAForTransition(updateContext: string): void {
+    setLatestUpdateContext(updateContext);
+    const qa = document.getElementById("qa");
+    if (!qa) {
+        return;
+    }
+    qa.replaceChildren();
+    _setQAInteractionEnabled(false);
+}
 
 export function _queueAction(action: Callback): void {
     _updatingQueue = _updatingQueue.then(action);
@@ -148,7 +178,10 @@ export async function _updateQA(
     _unusused: unknown,
     onupdate: Callback,
     onshown: Callback,
+    updateContext?: string,
 ): Promise<void> {
+    const updateIsCurrent = (): boolean => !updateContext || updateContext === latestUpdateContext;
+
     onUpdateHook.length = 0;
     onUpdateHook.push(onupdate);
 
@@ -167,7 +200,9 @@ export async function _updateQA(
     }
     await preloadResources(html);
 
-    qa.style.opacity = "0";
+    if (!updateIsCurrent()) {
+        return;
+    }
 
     try {
         await setInnerHTML(qa, html);
@@ -192,12 +227,36 @@ export async function _updateQA(
             .catch(renderError("MathJax"));
     }
 
-    qa.style.opacity = "1";
+    if (!updateContext) {
+        await _runHook(onShownHook);
+        return;
+    }
 
-    await _runHook(onShownHook);
+    if (!updateIsCurrent()) {
+        return;
+    }
+
+    await waitForNextPaint(
+        () => bridgeCommand(`qaPaintPending:${updateContext}`),
+        () => bridgeCommand(`qaPaintRetry:${updateContext}`),
+    );
+
+    if (updateIsCurrent()) {
+        _setQAInteractionEnabled(true);
+        await _runHook(onShownHook);
+        bridgeCommand(`qaPresented:${updateContext}`);
+    }
 }
 
-export function _showQuestion(q: string, a: string, bodyclass: string): void {
+export function _showQuestion(
+    q: string,
+    a: string,
+    bodyclass: string,
+    updateContext?: string,
+): void {
+    if (updateContext) {
+        setLatestUpdateContext(updateContext);
+    }
     _queueAction(() =>
         _updateQA(
             q,
@@ -220,6 +279,7 @@ export function _showQuestion(q: string, a: string, bodyclass: string): void {
                 // preload images
                 allImagesLoaded().then(() => preloadAnswerImages(a));
             },
+            updateContext,
         )
     );
 }
@@ -229,7 +289,14 @@ function scrollToAnswer(): void {
     bridgeCommand("repaintNeeded");
 }
 
-export function _showAnswer(a: string, bodyclass: string): void {
+export function _showAnswer(
+    a: string,
+    bodyclass?: string | null,
+    updateContext?: string,
+): void {
+    if (updateContext) {
+        setLatestUpdateContext(updateContext);
+    }
     _queueAction(() =>
         _updateQA(
             a,
@@ -246,6 +313,7 @@ export function _showAnswer(a: string, bodyclass: string): void {
             function() {
                 /* noop */
             },
+            updateContext,
         )
     );
 }

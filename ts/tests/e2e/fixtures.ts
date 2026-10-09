@@ -21,10 +21,39 @@ interface AnkiFixtures {
     legacyEditor: Page;
 }
 
-async function installBridgeStub(page: Page): Promise<void> {
-    // Runs before any page script; intercepts window.bridgeCommand so the
-    // editor doesn't throw when Qt's webChannelTransport is unavailable, and
-    // records every call for assertion.
+async function waitForCollectionReady(baseURL: string | undefined): Promise<void> {
+    if (!baseURL) {
+        throw new Error("Playwright baseURL is required for Anki e2e tests");
+    }
+
+    const readyURL = new URL("/_anki/getDeckNames", baseURL).toString();
+    const deadline = Date.now() + 30_000;
+    let lastStatus = 0;
+
+    while (Date.now() < deadline) {
+        try {
+            const response = await fetch(readyURL, {
+                method: "POST",
+                headers: { "Content-Type": "application/binary" },
+                body: new Uint8Array(),
+            });
+            lastStatus = response.status;
+            if (response.ok) {
+                return;
+            }
+        } catch {
+            lastStatus = 0;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    throw new Error(
+        `Timed out waiting for Anki collection readiness; last status=${lastStatus}`,
+    );
+}
+
+export async function installBridgeStub(page: Page): Promise<void> {
     await page.addInitScript(() => {
         (window as any).__bridgeCalls = [];
         (window as any).bridgeCommand = (
@@ -37,6 +66,11 @@ async function installBridgeStub(page: Page): Promise<void> {
 }
 
 export const test = base.extend<AnkiFixtures>({
+    page: async ({ page, baseURL }, use) => {
+        await waitForCollectionReady(baseURL);
+        await use(page);
+    },
+
     editorPage: async ({ page }, use) => {
         await installBridgeStub(page);
         await page.goto("/editor/?mode=add", { waitUntil: "domcontentloaded" });
@@ -45,16 +79,11 @@ export const test = base.extend<AnkiFixtures>({
     },
 
     editor: async ({ editorPage }, use) => {
-        // NoteEditor.svelte exposes loadNote via Object.assign(globalThis, ...)
-        // inside onMount. Wait for it before calling.
         await editorPage.waitForFunction(
             () => typeof (window as any).loadNote === "function",
             { timeout: 15_000 },
         );
-        // initial: true triggers defaultsForAdding() so the deck/notetype
-        // choosers are populated from the backend.
         await editorPage.evaluate(() => (window as any).loadNote({ initial: true }));
-        // At least one field container signals that the note loaded.
         await editorPage.waitForSelector(".field-container", { timeout: 15_000 });
         await use(editorPage);
     },

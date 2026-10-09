@@ -313,13 +313,19 @@ def int_version() -> int:
 
     from anki.buildinfo import version
 
-    match = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", version)
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?(?=$|[a-zA-Z+])", version)
     if not match:
         raise ValueError(f"unrecognised version: {version!r}")
 
-    year_num = int(match.group(1))
-    month_num = int(match.group(2))
-    patch_num = int(match.group(3)) if match.group(3) else 0
+    year, month, patch = match.groups()
+    patch = patch or "0"
+
+    year_num = int(year)
+    month_num = int(month)
+    patch_num = int(patch)
+
+    if year_num == 2 and month_num == 1:
+        return patch_num
 
     return year_num * 10_000 + month_num * 100 + patch_num
 

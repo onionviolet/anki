@@ -17,6 +17,7 @@ from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_REV, QUEUE_TYPE_SUSPENDED
 from anki.decks import DeckId
 from anki.lang import set_lang
 from anki.notes import Note
+from anki.scheduler_pb2 import SimulateFsrsReviewRequest, SimulateFsrsReviewResponse
 from aqt.weibao.review_capture import marker_tag
 from aqt.weibao.study_data import (
     CaptureDraft,
@@ -345,6 +346,38 @@ def test_retention_comparison_is_read_only_and_validates_inputs(
     assert col.undo_status() == undo_before
     with pytest.raises(ValueError, match="retention values"):
         compare_retention(col, 1, (float("nan"),), 30)
+
+
+def test_retention_comparison_uses_fsrs7_preset(
+    col: Collection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review_note(col, "FSRS7", 3)
+    col.set_config("fsrs", True)
+    data = col.decks.get_deck_configs_for_update(DeckId(1))
+    config = next(
+        item.config.config
+        for item in data.all_config
+        if item.config.id == data.current_deck.config_id
+    )
+    config.fsrs_version = config.FSRS_VERSION_SEVEN
+    config.fsrs_params_7[:] = [0.5] * 34
+    config.fsrs_params_6[:] = [1.0] * 21
+    config.fsrs_dynamic_desired_retention_enabled = True
+    config.fsrs_dynamic_desired_retention_params[:] = [0.1] * 15
+    monkeypatch.setattr(col.decks, "get_deck_configs_for_update", lambda _: data)
+    requests = []
+
+    def simulate(request: SimulateFsrsReviewRequest) -> SimulateFsrsReviewResponse:
+        requests.append(request)
+        return SimulateFsrsReviewResponse()
+
+    monkeypatch.setattr(col._backend, "simulate_fsrs_review", simulate)
+    compare_retention(col, 1, (0.9,), 30)
+    assert list(requests[0].params) == list(config.fsrs_params_7)
+    assert requests[0].simulate_dynamic_desired_retention
+    assert list(requests[0].fsrs_dynamic_desired_retention_params) == list(
+        config.fsrs_dynamic_desired_retention_params
+    )
 
 
 def test_overview_counts_due_and_repair_cards_without_mutation(col: Collection) -> None:

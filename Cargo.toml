@@ -32,9 +32,8 @@ git = "https://github.com/ankitects/linkcheck.git"
 rev = "2c7c081b148f8c1053df33768bc99f05311cb9a0"
 
 [workspace.dependencies.fsrs]
-version = "6.6.2"
-# git = "https://github.com/open-spaced-repetition/fsrs-rs.git"
-# path = "../open-spaced-repetition/fsrs-rs"
+git = "https://github.com/open-spaced-repetition/fsrs-rs.git"
+rev = "c137ee6e096f9217632397a8fb2bdb6f6e1b92ae"
 
 [workspace.dependencies]
 # local
@@ -113,7 +112,7 @@ rand = "0.9.4"
 rayon = "1.10.0"
 regex = "1.11.1"
 reqwest = { version = "0.12.20", default-features = false, features = ["json", "socks", "stream", "multipart"] }
-rusqlite = { version = "0.36.0", features = ["trace", "functions", "collation", "bundled"] }
+rusqlite = { version = "0.36.0", features = ["trace", "functions", "collation", "bundled", "blob"] }
 rustls-pemfile = "2.2.0"
 same-file = "1.0.6"
 scopeguard = "1.2.0"
@@ -130,7 +129,7 @@ syn = { version = "2.0.103", features = ["parsing", "printing"] }
 tar = "0.4.46"
 tempfile = "3.20.0"
 termcolor = "1.4.1"
-tokio = { version = "1.45", features = ["fs", "rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1.45", features = ["fs", "io-util", "rt-multi-thread", "macros", "signal"] }
 tokio-util = { version = "0.7.15", features = ["io"] }
 tower-http = { version = "0.6.6", features = ["trace"] }
 tracing = { version = "0.1.41", features = ["max_level_trace", "release_max_level_debug"] }

@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from anki.cards import CardId
 from anki.collection import Collection, OpChanges, OpChangesWithCount
+from anki.deck_config_pb2 import DeckConfig
 from anki.decks import DeckId
 from anki.models import NotetypeId
 from anki.notes import Note, NoteFieldsCheckResult, NoteId
@@ -401,12 +402,26 @@ def compare_retention(
     size = len(col.find_cards(search))
     if not size:
         raise ValueError("The selected deck has no active cards.")
+    versions = DeckConfig.Config
+    params = {
+        versions.FSRS_VERSION_SEVEN: config.fsrs_params_7,
+        versions.FSRS_VERSION_SIX: config.fsrs_params_6,
+        versions.FSRS_VERSION_FIVE: config.fsrs_params_5,
+        versions.FSRS_VERSION_FOUR: config.fsrs_params_4,
+    }[config.fsrs_version]
+    # The simulator protocol selects the FSRS version by parameter length.
+    # Empty legacy presets need explicit defaults, since empty means FSRS7.
+    if not params:
+        params = (
+            data.defaults.config.fsrs_params_7
+            if config.fsrs_version == versions.FSRS_VERSION_SEVEN
+            else data.defaults.config.fsrs_params_6
+        )
     results = []
     for retention in retentions:
         request = SimulateFsrsReviewRequest(
-            params=list(
-                config.fsrs_params_6 or config.fsrs_params_5 or config.fsrs_params_4
-            ),
+            params=list(params),
+            simulate_dynamic_desired_retention=config.fsrs_dynamic_desired_retention_enabled,
             desired_retention=retention,
             # Backend deck_size means additional unseen cards beyond the cards
             # returned by search. Simulate only the selected existing collection.
@@ -422,6 +437,16 @@ def compare_retention(
             historical_retention=config.historical_retention,
             learning_step_count=len(config.learn_steps),
             relearning_step_count=len(config.relearn_steps),
+            fsrs_dynamic_desired_retention_params=config.fsrs_dynamic_desired_retention_params,
+            fsrs_dynamic_desired_retention_weights=config.fsrs_dynamic_desired_retention_weights,
+            fsrs_dynamic_desired_retention_avg_drs=config.fsrs_dynamic_desired_retention_avg_drs,
+            fsrs_dynamic_desired_retention_fsrs_eq_weights=config.fsrs_dynamic_desired_retention_fsrs_eq_weights,
+            fsrs_dynamic_desired_retention_fsrs_eq_drs=config.fsrs_dynamic_desired_retention_fsrs_eq_drs,
+            fsrs_dynamic_desired_retention_fixed_target_weights=config.fsrs_dynamic_desired_retention_fixed_target_weights,
+            fsrs_dynamic_desired_retention_fixed_target_drs=config.fsrs_dynamic_desired_retention_fixed_target_drs,
+            fsrs_dynamic_desired_retention_min=config.fsrs_dynamic_desired_retention_min,
+            fsrs_dynamic_desired_retention_max=config.fsrs_dynamic_desired_retention_max,
+            fsrs_dynamic_desired_retention_clamp=config.fsrs_dynamic_desired_retention_clamp,
         )
         if config.leech_action == 0:
             request.suspend_after_lapse_count = config.leech_threshold
