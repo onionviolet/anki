@@ -61,3 +61,8 @@ weibao-yomitan = Yomitan setup
 weibao-hypertts = HyperTTS audio providers
 weibao-fsrs-helper = FSRS Helper
 weibao-close = Close
+
+## Optional local Mandarin speech
+
+weibao-qwen-generating = Generating local Mandarin audio…
+weibao-qwen-error = Local Mandarin speech failed: { $error }

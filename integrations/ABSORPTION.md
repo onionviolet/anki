@@ -66,6 +66,10 @@ For browser draft producers that already create AnkiConnect note JSON, use `guiA
 
 ### HyperTTS and local audio
 
+The [October 9 Mandarin TTS comparison](MANDARIN_TTS_RESEARCH_2026-10-09.md) shortlists MiniMax, CosyVoice, Qwen3, Fish and Doubao, with pronunciation controls, current listed costs and Anki integration paths. These are research recommendations; no alternative provider was installed or selected by that work.
+
+The user's subsequent free-local selection is implemented by the [optional Qwen adapter](qwen_tts/README.md). Its isolated runtime and pinned model were installed locally, WAV generation succeeded offline, and the synthetic reviewer test verified playback, cached reuse, cancellation/profile cleanup and safe mode. The fork's daily-app and collection state were not changed by this implementation.
+
 HyperTTS is absent from the daily add-on inventory. The reviewed [MacOS service at 05007b9](https://github.com/Vocab-Apps/anki-hyper-tts/blob/05007b9a0982f18fd6e679ce651fe356074f1dbe/hypertts_addon/services/service_macos.py) uses macOS `say` and Anki's MP3 encoder; it is opt-in and marked free. The main add-on, provider UI, credentials and remote providers are not installed or enabled by this fork. Provider dependency availability is recorded in the runtime transcript; no missing dependency was installed.
 
 The `integrations/local_speech.py` adapter exposes the installed-system-speech route without importing HyperTTS: `just local-speech 'Text to speak' /path/to/new.wav`. It generates PCM WAV, refuses an existing output path, and makes no provider request. Han text without Japanese kana defaults to `zh_CN`; other text uses the system voice. This is a Mandarin-specific assumption, not general language detection. Pass a language explicitly for Japanese, Cantonese, or other Han text, and for pinyin-only input. The optional recipe arguments are language, exact installed voice name, and rate in words per minute:

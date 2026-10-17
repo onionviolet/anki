@@ -968,6 +968,10 @@ def setup_audio(taskman: TaskManager, base_folder: str, media_folder: str) -> No
         from aqt.tts import MacTTSPlayer
 
         av_player.players.append(MacTTSPlayer(taskman))
+        if not getattr(aqt.mw, "safeMode", False):
+            from aqt.weibao.qwen_tts import QwenTTSPlayer
+
+            av_player.players.append(QwenTTSPlayer(taskman))
     elif is_win:
         from aqt.tts import WindowsTTSPlayer
 

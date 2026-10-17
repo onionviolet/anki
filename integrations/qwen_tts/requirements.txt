@@ -1,0 +1,2 @@
+mlx-audio==0.5.7
+librosa==0.11.0
