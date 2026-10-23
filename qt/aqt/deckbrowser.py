@@ -14,6 +14,7 @@ import aqt.operations
 import aqt.rwkv_scheduler
 from anki.collection import Collection, OpChanges
 from anki.decks import DeckCollapseScope, DeckId, DeckTreeNode
+from anki.scheduler import CustomStudyRequest
 from aqt import AnkiQt, gui_hooks
 from aqt.deckoptions import display_options_for_deck_id
 from aqt.operations import QueryOp
@@ -25,6 +26,7 @@ from aqt.operations.deck import (
     set_current_deck,
     set_deck_collapsed,
 )
+from aqt.operations.scheduling import custom_study
 from aqt.qt import *
 from aqt.sound import av_player
 from aqt.toolbar import BottomBar
@@ -130,6 +132,8 @@ class DeckBrowser:
         elif cmd == "drag":
             source, target = arg.split(",")
             self._handle_drag_and_drop(DeckId(int(source)), DeckId(int(target or 0)))
+        elif cmd == "extend":
+            self._extend_review_limit(DeckId(int(arg)))
         elif cmd == "collapse":
             self._collapse(DeckId(int(arg)))
         elif cmd == "v2upgrade":
@@ -144,6 +148,28 @@ class DeckBrowser:
                 parent=self.mw, deck_id=DeckId(int(arg))
             ).run_in_background()
         return False
+
+    def _extend_review_limit(self, deck_id: DeckId) -> None:
+        """Raise today's review limit so every due review card is available."""
+
+        def find(node: DeckTreeNode) -> DeckTreeNode | None:
+            if node.deck_id == deck_id:
+                return node
+            for child in node.children:
+                if found := find(child):
+                    return found
+            return None
+
+        node = find(self._render_data.tree)
+        if node is None:
+            return
+        extra = node.review_uncapped_including_children - node.review_count
+        if extra <= 0:
+            return
+        custom_study(
+            parent=self.mw,
+            request=CustomStudyRequest(deck_id=deck_id, review_limit_delta=extra),
+        ).success(lambda _: self.refresh()).run_in_background(initiator=self)
 
     def set_current_deck(self, deck_id: DeckId) -> None:
         self.cancel_rwkv_count_refresh()
@@ -467,6 +493,11 @@ class DeckBrowser:
             node.learn_count,
             "learn-count",
             f"deck-{node.deck_id}-learn-count",
+        )
+
+        review = (
+            f"<a href=# class=review-extend onclick='return pycmd(\"extend:{node.deck_id}\")' "
+            f"style='color:inherit;text-decoration:none'>{review}</a>"
         )
 
         buf += ("<td align=end>%s</td>" * 3) % (

@@ -37,6 +37,7 @@ repeated here unless they materially affect a fork feature.
 
 ### User facing changes
 
+- **Click the green due count to review past the limit.** In the deck list, clicking a deck's review count raises today's review limit so every due review card is available (the "/total" shown beside it).
 - **No immediate RWKV rebuild after deleting a deck.** Deck deletion and its undo/redo keep the current session's model state, including when deleting an empty deck or a deck containing only new cards. Removed reviews are excluded at the next canonical restore, normally after restarting Anki.
 
 ### Technical details
