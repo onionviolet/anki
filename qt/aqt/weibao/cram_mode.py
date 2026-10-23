@@ -6,14 +6,16 @@
 
 from __future__ import annotations
 
+import html
 import json
 import random
 import re
 from collections import deque
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from anki.collection import SearchNode
+from aqt.deckbrowser import DeckBrowser, DeckBrowserContent
 from aqt.qt import (
     QCheckBox,
     QComboBox,
@@ -333,3 +335,22 @@ def install(mw: AnkiQt) -> None:
     action.setShortcut(QKeySequence("Ctrl+Shift+K"))
     qconnect(action.triggered, show)
     gui_hooks.profile_will_close.append(close_profile)
+
+    def home_entry(_browser: DeckBrowser, content: DeckBrowserContent) -> None:
+        label = html.escape(tr.weibao_cram_mode())
+        content.stats += f"<p><button type='button' onclick=\"pycmd('weibao:cram-mode')\">{label}</button></p>"
+
+    def bridge(
+        handled: tuple[bool, Any], message: str, context: Any
+    ) -> tuple[bool, Any]:
+        if (
+            not handled[0]
+            and message == "weibao:cram-mode"
+            and isinstance(context, DeckBrowser)
+        ):
+            show()
+            return True, None
+        return handled
+
+    gui_hooks.deck_browser_will_render_content.append(home_entry)
+    gui_hooks.webview_did_receive_js_message.append(bridge)

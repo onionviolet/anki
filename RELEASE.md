@@ -37,7 +37,7 @@ repeated here unless they materially affect a fork feature.
 
 ### User facing changes
 
-- **Cram mode.** Tools > Cram mode (Ctrl+Shift+K) flips through every unsuspended card in a chosen deck, Quizlet style. Click or press Space to flip, swipe or press Right for "Know it", Left for "Still learning" (the card returns later in the pass), Z to undo. It never changes scheduling or review history.
+- **Cram mode.** The deck list's Cram mode button, or Tools > Cram mode (Ctrl+Shift+K), flips through every unsuspended card in a chosen deck, Quizlet style. Click or press Space to flip, swipe or press Right for "Know it", Left for "Still learning" (the card returns later in the pass), Z to undo. It never changes scheduling or review history.
 - **Browse no longer crashes while the sidebar refreshes.** The sidebar now detaches its old model before deleting it, avoiding a native crash seen when macOS accessibility was querying the view.
 - **Click the green due count to review past the limit.** In the deck list, clicking a deck's review count raises today's review limit so every due review card is available (the "/total" shown beside it).
 - **Neutral Qwen reading style and runaway protection.** Local Mandarin speech now requests a clear, steady, neutral delivery. Generation limits scale with text length; unfinished clips are rejected instead of cached and played. Old clips are regenerated under the new settings. Spoken words are not independently verified against the source text. An overrun is retried twice with a different seed before the error is shown, and the error now names the text.
