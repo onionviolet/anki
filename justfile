@@ -23,11 +23,29 @@ study-runtime:
 local-speech text output lang='auto' voice='' rate='170':
     PYTHONPATH=pylib python3 integrations/local_speech.py {{ quote(text) }} {{ quote(output) }} --lang {{ quote(lang) }} --voice {{ quote(voice) }} --rate {{ quote(rate) }}
 
+# Install the isolated optional Qwen runtime and download its pinned Mandarin model
+qwen-setup:
+    {{ ninja }} pyenv
+    PYTHONPATH=pylib out/pyenv/bin/python integrations/qwen_tts/setup.py
+
+# Create a new Mandarin WAV with the installed offline Qwen model
+qwen-speech text output speaker='Vivian' speed='1':
+    PYTHONPATH=pylib out/pyenv/bin/python integrations/qwen_tts/speech.py {{ quote(text) }} {{ quote(output) }} --speaker {{ quote(speaker) }} --speed {{ quote(speed) }}
+
+# Verify Qwen reviewer playback, cache, profile-close cleanup and safe mode on synthetic data
+qwen-runtime:
+    just build
+    PYTHONPATH=pylib:qt:out/pylib:out/qt out/pyenv/bin/python integrations/qwen_tts/launch.py
+
+# Compare Qwen reading profiles on synthetic text without audio playback
+qwen-reading-probe:
+    PYTHONPATH=pylib out/pyenv/bin/python integrations/qwen_tts/reading_probe.py
+
 # Format and lint the standalone optional integration/runtime tooling
 study-tools-check:
     just build
-    out/pyenv/bin/ruff check --select E4,E7,E9,F,I --fix integrations/local_speech.py integrations/study_runtime
-    out/pyenv/bin/ruff format integrations/local_speech.py integrations/study_runtime
+    out/pyenv/bin/ruff check --select E4,E7,E9,F,I --fix integrations/local_speech.py integrations/study_runtime integrations/qwen_tts
+    out/pyenv/bin/ruff format integrations/local_speech.py integrations/study_runtime integrations/qwen_tts
 
 # Run the bundled ankictl client against a running Anki instance
 bridge *args:

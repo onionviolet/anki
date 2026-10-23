@@ -38,10 +38,13 @@ repeated here unless they materially affect a fork feature.
 ### User facing changes
 
 - **Click the green due count to review past the limit.** In the deck list, clicking a deck's review count raises today's review limit so every due review card is available (the "/total" shown beside it).
+- **Neutral Qwen reading style and runaway protection.** Local Mandarin speech now requests a clear, steady, neutral delivery. Generation limits scale with text length; unfinished clips are rejected instead of cached and played. Old clips are regenerated under the new settings. Spoken words are not independently verified against the source text. An overrun is retried twice with a different seed before the error is shown, and the error now names the text.
+- **Offline Qwen Mandarin speech.** An optional local model provides Vivian, Serena and Uncle Fu voices for Mandarin card TTS and WAV export. Generated clips are cached; replay does not need network access. Explicit voice choices are preserved, and safe mode skips Qwen.
 - **No immediate RWKV rebuild after deleting a deck.** Deck deletion and its undo/redo keep the current session's model state, including when deleting an empty deck or a deck containing only new cards. Removed reviews are excluded at the next canonical restore, normally after restarting Anki.
 
 ### Technical details
 
+- **Qwen runtime:** isolate MLX-Audio and model weights from Anki's Python environment. A persistent subprocess generates audio outside the UI thread, supports cancellation and profile-close cleanup, and caches by model revision, voice, text and speed. Optional setup and export use `just qwen-setup` and `just qwen-speech`.
 - **RWKV deck deletion:** reuse collection mutation reconciliation with the affected deck tree's cards, including cards borrowed by filtered decks. Removed historical cards make the resident cache identity unknown, preventing that state from being persisted as canonical; deleting a filtered deck preserves state when its cards keep their historical identities.
 
 ## [26.09.3+fsrs7.build.100](https://github.com/JSchoreels/anki/releases/tag/26.09.3%2Bfsrs7.build.100) — 2026-10-08

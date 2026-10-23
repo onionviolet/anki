@@ -26,6 +26,8 @@ Yomitan can use the bundled AnkiConnect bridge; its direct add action bypasses p
 
 On macOS, reviewer tags such as `{{tts zh_CN:Simplified}}` prefer installed Tingting/Tian-Tian voices over the alphabetical fallback; `zh_TW` prefers Meijia. Labeled Premium/Enhanced variants take precedence when available. An explicit template voice still wins, and other languages retain their existing order. Both live and file-based macOS TTS use the same preference. This changes voice selection, not the engine's pronunciation dictionary; ambiguous words may still need a recording with the intended reading.
 
+For stronger local Mandarin speech on Apple Silicon, the optional [Qwen runtime](integrations/qwen_tts/README.md) supplies `Qwen3_Vivian`, `Qwen3_Serena` and `Qwen3_Uncle_Fu`. Run `just qwen-setup` to install its isolated environment and pinned model; `just qwen-speech` exports a new WAV for preview/import. The configured engine becomes the fallback for unqualified `zh_CN` tags; explicit voice choices retain priority. Generation stays off the UI thread, clips are cached, profile close releases the worker, and safe mode skips it. The source integration and synthetic reviewer probe passed; daily-app installation and pronunciation listening acceptance remain separate.
+
 ## Study bridge
 
 The first-party [`ankictl`](https://github.com/onionviolet/ankictl) client is included in `integrations/ankictl/` and packaged as a standalone `ankictl` console command in the desktop Python wheel. Run `just bridge ping` to check its connection, or `just bridge repair --json` to list reviewer repair markers. The pinned source and license are recorded in `integrations/ankictl/SOURCE.md`.
