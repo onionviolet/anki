@@ -176,10 +176,14 @@ class SidebarTreeView(QTreeView):
             # block repainting during refreshing to avoid flickering
             self.setUpdatesEnabled(False)
 
-            if old_model := self.model():
-                old_model.deleteLater()
+            old_model = self.model()
             model = SidebarModel(self, root)
             self.setModel(model)
+            # detach first: deleting a model the view (and macOS
+            # accessibility) still references crashes in Qt
+            if old_model:
+                old_model.setParent(None)
+                old_model.deleteLater()
 
             if self.current_search:
                 self.search_for(self.current_search)

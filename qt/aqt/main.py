@@ -1211,6 +1211,9 @@ title="{}" {}>{}</button>""".format(
             from aqt.weibao.study_dialog import install as install_study_tools
 
             install_study_tools(self)
+            from aqt.weibao.cram_mode import install as install_cram_mode
+
+            install_cram_mode(self)
 
     def maybe_check_for_addon_updates(
         self, on_done: Callable[[list[DownloadLogEntry]], None] | None = None

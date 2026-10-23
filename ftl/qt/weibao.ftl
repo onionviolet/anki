@@ -1,6 +1,17 @@
 ## Personal desktop study tools
 
 weibao-study-tools = Study tools
+weibao-cram-mode = Cram mode
+weibao-cram-all-decks = All decks
+weibao-cram-shuffle = Shuffle
+weibao-cram-restart = Restart
+weibao-cram-still-learning = ← Still learning
+weibao-cram-flip = Flip (Space)
+weibao-cram-know-it = Know it →
+weibao-cram-undo = Undo (Z)
+weibao-cram-progress = { $known } of { $total } known, { $missed } missed at least once
+weibao-cram-done = All cards known. Nice.
+weibao-cram-empty = No cards to cram in this deck.
 weibao-overview = Overview
 weibao-repairs = Repairs
 weibao-capture = Capture
