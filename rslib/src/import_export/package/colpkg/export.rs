@@ -359,7 +359,7 @@ mod test {
         const NAME: &str = "backup.colpkg";
         const ENV: &str = "ANKI_TEST_BACKUP_WRITE_FAILURE";
         if let Some(backup_dir) = std::env::var_os(ENV) {
-            use rand::RngCore;
+            use rand::Rng;
             use rand::SeedableRng;
 
             let mut data = vec![0; 64 * 1024];

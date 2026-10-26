@@ -92,14 +92,16 @@ impl MetaExt for Meta {
             // metadata must not make that dummy look like a usable backup.
             if archive
                 .file_names()
-                .any(|name| name == "collection.anki21b")
+                .any(|name| name.is_ok_and(|name| name == "collection.anki21b"))
             {
                 return Err(AnkiError::ImportError {
                     source: ImportError::Corrupt,
                 });
             }
             Meta {
-                version: if archive.file_names().any(|name| name == "collection.anki21") {
+                version: if archive
+                    .file_names()
+                    .any(|name| name.is_ok_and(|name| name == "collection.anki21")) {
                     Version::Legacy2
                 } else {
                     Version::Legacy1
