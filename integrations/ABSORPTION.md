@@ -156,3 +156,7 @@ The C6/#5761 `just check` gate passed: 1,194 Rust tests (13 skipped), 1,182 Qt t
 `just study-runtime` passed on the final integrated source, including both normal and safe mode in a new synthetic temporary base. The [transcript](study_runtime/evidence/2026-10-09.txt) records the real application and asynchronous operation checks. `just wheels` built both desktop wheels; archive inspection verified study/TTS source bytes, the built bridge, hourly stats data and bundled integration licenses. The final `just check` gate reuses passing source stamps: 1,194 Rust tests (13 skipped), 1,182 Qt tests (6 skipped), 215 pylib tests, 187 TypeScript tests and 84 tooling tests. Phase 4 e2e passed 47 tests, 1 skipped.
 
 The [outcome report](REVIEW-2026-10-08.md) records per-phase conflicts, resolutions, commits and gates. These are source, runtime and packaging results. Installed-app validation and human acceptance remain open. No daily app/profile/collection write, push or PR occurred.
+
+## October 13 absorption
+
+The [current outcome](../docs/absorb-improvements-outcome-2026-10-13.md) records the official card-generation and help-layout fixes, the JSchoreels interday-learning priority fix, source comparisons, passing source/runtime/package gates, and the staged installed candidate. The verified wheels are now installed in Anki Weibao and the real launcher reopened User 1 with unchanged card, note and deck counts. The previous environment has a verified rollback copy. Personal templates, scheduler selections and cloud sync were preserved.

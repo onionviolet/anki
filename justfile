@@ -132,6 +132,11 @@ test-e2e ui='': _install-playwright-browsers
     {{ ninja }} pyenv ts:generated pylib qt
     {{ playwright_env }} {{ yarn }} test:e2e {{ ui }}
 
+# Run selected browser tests or pass Playwright filtering options
+test-e2e-target *args: _install-playwright-browsers
+    {{ ninja }} pyenv ts:generated pylib qt
+    {{ playwright_env }} {{ yarn }} test:e2e {{ args }}
+
 [private]
 _test:
     {{ ninja }} check:rust_test check:pytest check:vitest
