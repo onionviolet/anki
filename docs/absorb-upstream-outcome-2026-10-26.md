@@ -30,7 +30,7 @@ Fetched: `jschoreels/main` is 87 non-merge commits ahead (`96af4ca9d`, build 107
 
 ## Verification
 
-- `just check` passed on the final commit `1ad297166` (Build succeeded). It was run five times, not once: runs 1 to 4 each stopped at a real defect listed above (stale licenses.json, advisory failures, build break from rand/zip, rustfmt, cram test collection plus mypy). Pytest in that final run: 1,197 Qt tests passed, 6 skipped; vitest 34 files passed. One earlier vitest run timed out a hook in `reviewer/mathjax.test.ts` (10 s) under load and passed on the next run.
+- `just check` passed on the final commit `1ad297166` (Build succeeded). It was run five times, not once: runs 1 to 4 each stopped at a real defect listed above (stale licenses.json, advisory failures, build break from rand/zip, rustfmt, cram test collection plus mypy). Pytest in that final run: 1,197 Qt tests passed, 6 skipped; vitest 34 files passed. The runs shared the machine with other sessions' builds (load average above 100 per the coordinator), so treat slow timings as contention. One earlier vitest run timed out a hook in `reviewer/mathjax.test.ts` (10 s) under load and passed on the next run.
 - Fork additions verified present: `qt/aqt/weibao/cram_mode.py`, deck-list Cram button commit `7f8ea7ff8`, cram + sidebar commit `a83b5ec12` and Qwen commit `bc15ff5af` are ancestors; the files for Qwen speech (`integrations/qwen_tts/*`, `integrations/local_speech.py`, `pylib/anki/_qwen_tts_worker.py`), the Browse sidebar test and the cram/Qwen/local-speech tests are byte-identical to the pre-merge tree.
 - Not done: Rust test suite (`just test-rust`), e2e, wheels, installed candidate, human acceptance. `just check` compiles Rust and the Python/TS tests only.
 
