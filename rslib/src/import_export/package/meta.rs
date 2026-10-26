@@ -101,7 +101,8 @@ impl MetaExt for Meta {
             Meta {
                 version: if archive
                     .file_names()
-                    .any(|name| name.is_ok_and(|name| name == "collection.anki21")) {
+                    .any(|name| name.is_ok_and(|name| name == "collection.anki21"))
+                {
                     Version::Legacy2
                 } else {
                     Version::Legacy1
