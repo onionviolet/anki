@@ -1,7 +1,13 @@
 # Copyright: Ankitects Pty Ltd and contributors
 # License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
-from aqt.weibao.cram_mode import CramSession, split_sides
+from unittest import mock
+
+from aqt.utils import tr
+
+# aqt.deckbrowser translates strings at import time, before a backend exists.
+with mock.patch.object(tr, "_translate", lambda *args, **kwargs: ""):
+    from aqt.weibao.cram_mode import CramSession, split_sides
 
 
 def ids(*n: int) -> list:

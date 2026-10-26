@@ -151,7 +151,7 @@ class DataModel(QAbstractTableModel):
             enabled = bottom - top + 1
             if disabled:
                 enabled -= sum(
-                    map(disabled.__contains__, self._items[top : bottom + 1])
+                    self._items[row] in disabled for row in range(top, bottom + 1)
                 )
             cells += enabled * selection_range.width()
         return cells
