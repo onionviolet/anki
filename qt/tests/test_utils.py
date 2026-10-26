@@ -99,3 +99,25 @@ def test_tooltip_uses_available_window_when_parent_deleted(
     finally:
         utils.closeTooltip()
         app.processEvents()
+
+
+def test_qt_menu_shortcut_workaround_applies_to_submenus(qapp) -> None:
+    from aqt.qt import QMenu
+    from aqt.utils import qtMenuShortcutWorkaround
+
+    menu = QMenu()
+    top_action = menu.addAction("Top")
+    submenu = menu.addMenu("Submenu")
+    assert submenu is not None
+    nested_action = submenu.addAction("Nested")
+
+    assert top_action is not None
+    assert nested_action is not None
+
+    top_action.setShortcutVisibleInContextMenu(False)
+    nested_action.setShortcutVisibleInContextMenu(False)
+
+    qtMenuShortcutWorkaround(menu)
+
+    assert top_action.isShortcutVisibleInContextMenu()
+    assert nested_action.isShortcutVisibleInContextMenu()

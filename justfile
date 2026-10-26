@@ -301,6 +301,10 @@ test-py-target *args:
 clean *args:
     ./tools/clean {{ args }}
 
+# Fill the placeholder files in the docs directory with the english content.
+docs-release:
+    {{ ninja }} docs:release
+
 # Helpers to get the right commands for the platform
 
 ninja := if os() == "windows" { "tools\\ninja" } else { "./ninja" }

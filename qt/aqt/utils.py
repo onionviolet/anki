@@ -1199,6 +1199,8 @@ class MenuItem:
 def qtMenuShortcutWorkaround(qmenu: QMenu) -> None:
     for act in qmenu.actions():
         act.setShortcutVisibleInContextMenu(True)
+        if submenu := act.menu():
+            qtMenuShortcutWorkaround(submenu)
 
 
 ######################################################################

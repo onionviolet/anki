@@ -3,10 +3,10 @@
 
 # Anki Architecture
 
-<!-- <<<cog
+<!-- <<<<cog
 from cogdocs import get_file_contents
 cog.out(get_file_contents("architecture"))
->>> -->
+>>>> -->
 
 Very brief notes for now.
 
@@ -567,4 +567,4 @@ Current exact-vs-scalar status:
 - Legacy sqlite FSRS helper expressions continue to use stored scalar decay, but
   the standard retrievability search/order paths above no longer depend on them.
 
-<!-- <<<end>>> -->
+<!-- <<<<end>>>> -->
