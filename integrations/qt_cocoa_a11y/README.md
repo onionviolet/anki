@@ -1,6 +1,6 @@
 # Qt Cocoa accessibility patch (Browse crash)
 
-*Type: CURRENT-STATE. Audience: maintainer reference.*
+_Type: CURRENT-STATE. Audience: maintainer reference._
 
 ## Problem
 
