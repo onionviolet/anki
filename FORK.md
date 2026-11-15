@@ -52,3 +52,7 @@ Current integration gate, October 9, 2026: all six phases passed their required 
 ## October 13 absorption
 
 The [current outcome](docs/absorb-improvements-outcome-2026-10-13.md) records the official card-generation and help-layout fixes, the JSchoreels interday-learning priority fix, source comparisons, passing source/runtime/package gates, and the staged installed candidate. The verified wheels are now installed in Anki Weibao and the real launcher reopened User 1 with unchanged card, note and deck counts. The previous environment has a verified rollback copy. Personal templates, scheduler selections and cloud sync were preserved.
+
+## Qt accessibility patch (November 14)
+
+Anki Weibao segfaulted when Codex Computer Use read the Browse table while a row was selected. The cause is a Qt Cocoa plugin bug (QTBUG-149612) present in Qt 6.9.1, 6.10.2 and 6.11.2, with upstream Anki code as well as the fork's. [`integrations/qt_cocoa_a11y/`](integrations/qt_cocoa_a11y/README.md) holds the two-line ownership patch, the build-and-install script and a repro. In the disposable repro, stock 6.11.2 crashed within 12 accessibility reads; the patched plugin survived two runs of about 40 Browse cycles and over 200 full-tree reads each. The patched `libqcocoa.dylib` is installed in the Anki Weibao venv, with the original kept under `rollbacks/2026-11-14-qcocoa-before-a11y-patch/`. The real launcher reopened User 1 with 48,903 cards and 40 decks. Rebuild the plugin after any `pyqt6-qt6` change, and drop the patch once a Qt release includes the fix.
