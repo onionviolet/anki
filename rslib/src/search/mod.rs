@@ -1,4 +1,4 @@
-// Copyright: Ankitects Pty Ltd and contributors
+// Copyright: Anki Software, LLC and contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 mod builder;
@@ -1132,44 +1132,38 @@ mod test {
         let nt = col.get_notetype_by_name("Basic")?.unwrap();
         assert_ne!(nt.config.sort_field_idx, 2);
 
-        let mut add_note = |front: &str, frequency: &str| -> Result<NoteId> {
+        for frequency in ["499", "500", "550", "600", "1500", "abc"] {
             let mut note = nt.new_note();
-            note.set_field(0, front)?;
+            note.set_field(0, "not numeric")?;
             note.set_field(2, frequency)?;
             col.add_note(&mut note, DeckId(1))?;
-            Ok(note.id)
+        }
+
+        let mut matching_frequencies = |query: &str| -> Result<Vec<String>> {
+            let mut ids = col.search_notes(query, SortMode::NoOrder)?;
+            ids.sort();
+            ids.into_iter()
+                .map(|id| Ok(col.storage.get_note(id)?.unwrap().fields()[2].clone()))
+                .collect()
         };
 
-        let lower_bound = add_note("lower bound", "500")?;
-        let in_range = add_note("in range", "550")?;
-        let upper_bound = add_note("upper bound", "600")?;
-        let too_high = add_note("too high", "1500")?;
-        let not_numeric = add_note("not numeric", "abc")?;
-
-        let mut ids = col.search_notes("Frequency>500 Frequency<600", SortMode::NoOrder)?;
-        ids.sort();
-        assert_eq!(ids, vec![in_range]);
-
-        let ids = col.search_notes("Frequency<600", SortMode::NoOrder)?;
-        assert!(ids.contains(&lower_bound));
-        assert!(!ids.contains(&upper_bound));
-        assert!(!ids.contains(&too_high));
-        assert!(!ids.contains(&not_numeric));
-
-        let mut ids = col.search_notes("Frequency:[500,600]", SortMode::NoOrder)?;
-        ids.sort();
-        assert_eq!(ids, vec![lower_bound, in_range, upper_bound]);
-
-        let mut ids = col.search_notes("Frequency:[500,600[", SortMode::NoOrder)?;
-        ids.sort();
-        assert_eq!(ids, vec![lower_bound, in_range]);
-
-        let mut ids = col.search_notes("Frequency:]500,600]", SortMode::NoOrder)?;
-        ids.sort();
-        assert_eq!(ids, vec![in_range, upper_bound]);
-
-        let ids = col.search_notes("Frequency:]500,600[", SortMode::NoOrder)?;
-        assert_eq!(ids, vec![in_range]);
+        assert_eq!(
+            matching_frequencies("Frequency>500 Frequency<600")?,
+            ["550"]
+        );
+        assert_eq!(matching_frequencies("Frequency<500")?, ["499"]);
+        assert_eq!(matching_frequencies("Frequency<=500")?, ["499", "500"]);
+        assert_eq!(matching_frequencies("Frequency=500")?, ["500"]);
+        assert_eq!(matching_frequencies("Frequency>=600")?, ["600", "1500"]);
+        assert_eq!(matching_frequencies("Frequency>600")?, ["1500"]);
+        // Fork: bracket ranges, `[` inclusive and `]` exclusive on either side.
+        assert_eq!(
+            matching_frequencies("Frequency:[500,600]")?,
+            ["500", "550", "600"]
+        );
+        assert_eq!(matching_frequencies("Frequency:[500,600[")?, ["500", "550"]);
+        assert_eq!(matching_frequencies("Frequency:]500,600]")?, ["550", "600"]);
+        assert_eq!(matching_frequencies("Frequency:]500,600[")?, ["550"]);
 
         Ok(())
     }
