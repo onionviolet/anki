@@ -231,6 +231,7 @@ mod tests {
             due_today_by_preset: HashMap::from([(deck_config_id, due_today)]),
             reviewed_today_by_preset: HashMap::from([(deck_config_id, reviewed_today)]),
             easy_days_percentages_by_preset: HashMap::from([(deck_config_id, easy_days)]),
+            review_fuzz_config: Default::default(),
         }
     }
 

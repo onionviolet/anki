@@ -1477,6 +1477,8 @@ mod tests {
     use fsrs::SimulatorCardUpdatePhase;
     use fsrs::SimulatorConfig;
     use fsrs::DEFAULT_PARAMETERS;
+    use fsrs::FSRS;
+    use itertools::Itertools;
 
     use super::apply_simulation_desired_retention;
     use super::apply_simulation_desired_retention_to_cards;
@@ -1488,6 +1490,9 @@ mod tests {
     use super::SimulationPresetRoute;
     use super::SimulationPresetRouter;
     use crate::card::Card;
+    use crate::card::CardQueue;
+    use crate::card::CardType;
+    use crate::card::FsrsMemoryState;
     use crate::deckconfig::ReviewCardOrder;
     use crate::prelude::*;
     use crate::scheduler::fsrs::preset::AddonFsrsPreset;
@@ -1502,6 +1507,24 @@ mod tests {
     use crate::scheduler::fsrs::review_time_model::HelpMeDecideReviewTimeModel;
     use crate::scheduler::fsrs::review_time_model::R_BUCKET_COUNT;
     use crate::tests::NoteAdder;
+
+    fn base_request() -> SimulateFsrsReviewRequest {
+        SimulateFsrsReviewRequest {
+            desired_retention: 0.85,
+            deck_size: 50,
+            days_to_simulate: 20,
+            new_limit: 5,
+            review_limit: 1000,
+            max_interval: 365,
+            easy_days_percentages: vec![0.0; 7],
+            review_order: ReviewCardOrder::Random as i32,
+            suspend_after_lapse_count: Some(3),
+            historical_retention: 0.9,
+            learning_step_count: 3,
+            relearning_step_count: 2,
+            ..Default::default()
+        }
+    }
 
     fn no_transitions() -> [[u32; 4]; 4] {
         [[0u32; 4]; 4]
@@ -2954,6 +2977,8 @@ mod tests {
         let params = Arc::new(fsrs::check_and_fill_parameters(&[]).unwrap());
         let memory_state = FsrsMemoryState {
             stability: 10.0,
+            stability_internal: 10.0,
+            stability_fast: None,
             difficulty: 3.0,
         };
         Card::convert(card, 10, memory_state, 0.85, params.clone())

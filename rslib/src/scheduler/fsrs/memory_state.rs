@@ -2798,7 +2798,11 @@ mod tests {
                 .unwrap();
 
             let card_id = card.id;
-            col.grade_now(&[card_id], 3)?;
+            col.grade_now(anki_proto::scheduler::GradeNowRequest {
+                card_ids: vec![card_id.into()],
+                rating: anki_proto::scheduler::card_answer::Rating::Easy as i32,
+                ..Default::default()
+            })?;
 
             let req = Some(UpdateMemoryStateRequest {
                 params: vec![],
@@ -2807,6 +2811,7 @@ mod tests {
                 max_interval: 365,
                 reschedule: true,
                 deck_desired_retention: HashMap::new(),
+                review_fuzz_config: Default::default(),
             });
 
             update_memory_state_for_card(&mut col, card_id, req.clone())?;
